@@ -107,7 +107,7 @@ jobs:
       - name: Extract version
         id: version
         run: |
-            VERSION=$(grep -E '^version\s*=\s*".*"' Cargo.toml | head -n1 | cut -d'"' -f2)
+            VERSION=$(grep -E '^version\s*=\s*".*"' controller/Cargo.toml | head -n1 | cut -d'"' -f2)
             echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Docker meta
