@@ -1,0 +1,17 @@
+[package]
+name = "mullvad-daita-controller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+env_logger = "0.11"
+hex = "0.4"
+ipnetwork = "0.21"
+log = "0.4"
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "signal"] }
+tun = "0.8.6"
+talpid-tunnel-config-client = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "8f4f4d4de18c275c8fa1ddd1c6642819bd13d736", package = "talpid-tunnel-config-client" }
+talpid-types = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "8f4f4d4de18c275c8fa1ddd1c6642819bd13d736", package = "talpid-types" }
+wireguard-go-rs = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "8f4f4d4de18c275c8fa1ddd1c6642819bd13d736", package = "wireguard-go-rs" }

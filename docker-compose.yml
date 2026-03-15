@@ -1,0 +1,16 @@
+services:
+  mullvad4docker:
+    image: ghcr.io/knylbyte/mullvad4docker:latest
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      DAITA_ENABLED: "true"
+      DANTE_ENABLED: "false"
+      KILLSWITCH_ENABLED: "false"
+      WG_INTERFACE: wg0
+      WG_CONFIG_FILE: /etc/wireguard/wg0.conf
+    volumes:
+      - ./wireguard:/etc/wireguard:ro
+    restart: unless-stopped

@@ -1,0 +1,556 @@
+use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
+use ipnetwork::IpNetwork;
+use std::ffi::CString;
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
+use talpid_types::net::wireguard::{PresharedKey, PrivateKey, PublicKey};
+
+const DEFAULT_MTU: u16 = 1380;
+const DEFAULT_CONFIG_SERVICE_IPV4: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 1);
+
+#[derive(Clone, Debug, Default)]
+pub struct Hooks {
+    pub pre_up: Vec<String>,
+    pub post_up: Vec<String>,
+    pub pre_down: Vec<String>,
+    pub post_down: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerSettings {
+    pub public_key: PublicKey,
+    pub endpoint: SocketAddr,
+    pub allowed_ips: Vec<IpNetwork>,
+    pub preshared_key: Option<PresharedKey>,
+    pub persistent_keepalive: Option<u16>,
+    pub constant_packet_size: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedConfig {
+    pub private_key: PrivateKey,
+    pub addresses: Vec<IpNetwork>,
+    pub dns_servers: Vec<IpAddr>,
+    pub mtu: u16,
+    pub fwmark: Option<u32>,
+    pub hooks: Hooks,
+    pub entry_peer: PeerSettings,
+    pub exit_peer: Option<PeerSettings>,
+}
+
+impl ParsedConfig {
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read WireGuard config {}", path.display()))?;
+
+        let mut section = String::new();
+        let mut interface_private_key = None;
+        let mut interface_addresses = Vec::new();
+        let mut interface_dns = Vec::new();
+        let mut interface_mtu = None;
+        let mut interface_fwmark = None;
+        let mut hooks = Hooks::default();
+
+        let mut parsed_peers = Vec::new();
+        let mut current_peer = PendingPeer::default();
+        let mut in_peer_section = false;
+
+        for (index, raw_line) in content.lines().enumerate() {
+            let line_number = index + 1;
+            let line = strip_comments(raw_line).trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with('[') && line.ends_with(']') {
+                if in_peer_section {
+                    parsed_peers.push(current_peer.finish()?);
+                    current_peer = PendingPeer::default();
+                    in_peer_section = false;
+                }
+
+                section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+                if section == "peer" {
+                    in_peer_section = true;
+                }
+                continue;
+            }
+
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| anyhow!("invalid line {} in WireGuard config", line_number))?;
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+
+            match section.as_str() {
+                "interface" => match key.as_str() {
+                    "privatekey" => {
+                        interface_private_key = Some(
+                            PrivateKey::from_base64(value)
+                                .context("invalid Interface.PrivateKey")?,
+                        );
+                    }
+                    "address" => {
+                        interface_addresses.extend(parse_interface_networks(value).with_context(
+                            || format!("invalid Interface.Address on line {}", line_number),
+                        )?);
+                    }
+                    "dns" => {
+                        interface_dns.extend(parse_ip_list(value).with_context(|| {
+                            format!("invalid Interface.DNS on line {}", line_number)
+                        })?);
+                    }
+                    "mtu" => {
+                        interface_mtu = Some(value.parse::<u16>().with_context(|| {
+                            format!("invalid Interface.MTU on line {}", line_number)
+                        })?);
+                    }
+                    "fwmark" => {
+                        interface_fwmark = Some(value.parse::<u32>().with_context(|| {
+                            format!("invalid Interface.FwMark on line {}", line_number)
+                        })?);
+                    }
+                    "preup" => hooks.pre_up.push(value.to_string()),
+                    "postup" => hooks.post_up.push(value.to_string()),
+                    "predown" => hooks.pre_down.push(value.to_string()),
+                    "postdown" => hooks.post_down.push(value.to_string()),
+                    "table" | "saveconfig" | "listenport" => {
+                        log::warn!(
+                            "ignoring unsupported Interface.{} in {}",
+                            key,
+                            path.display()
+                        );
+                    }
+                    _ => {
+                        log::warn!("ignoring unknown Interface.{} in {}", key, path.display());
+                    }
+                },
+                "peer" => match key.as_str() {
+                    "publickey" => {
+                        current_peer.public_key =
+                            Some(PublicKey::from_base64(value).context("invalid Peer.PublicKey")?);
+                    }
+                    "endpoint" => {
+                        current_peer.endpoint =
+                            Some(value.parse::<SocketAddr>().with_context(|| {
+                                format!("invalid Peer.Endpoint on line {}", line_number)
+                            })?);
+                    }
+                    "allowedips" => {
+                        current_peer
+                            .allowed_ips
+                            .extend(parse_network_list(value).with_context(|| {
+                                format!("invalid Peer.AllowedIPs on line {}", line_number)
+                            })?);
+                    }
+                    "presharedkey" => {
+                        current_peer.preshared_key =
+                            Some(parse_preshared_key(value).with_context(|| {
+                                format!("invalid Peer.PresharedKey on line {}", line_number)
+                            })?);
+                    }
+                    "persistentkeepalive" => {
+                        current_peer.persistent_keepalive =
+                            Some(value.parse::<u16>().with_context(|| {
+                                format!("invalid Peer.PersistentKeepalive on line {}", line_number)
+                            })?);
+                    }
+                    _ => {
+                        log::warn!("ignoring unknown Peer.{} in {}", key, path.display());
+                    }
+                },
+                _ => {
+                    bail!("unsupported or missing section near line {}", line_number);
+                }
+            }
+        }
+
+        if in_peer_section {
+            parsed_peers.push(current_peer.finish()?);
+        }
+
+        let private_key =
+            interface_private_key.ok_or_else(|| anyhow!("missing Interface.PrivateKey"))?;
+        if interface_addresses.is_empty() {
+            bail!("missing Interface.Address");
+        }
+
+        let (entry_peer, exit_peer) = classify_peers(parsed_peers)?;
+
+        Ok(Self {
+            private_key,
+            addresses: interface_addresses,
+            dns_servers: interface_dns,
+            mtu: interface_mtu.unwrap_or(DEFAULT_MTU),
+            fwmark: interface_fwmark,
+            hooks,
+            entry_peer,
+            exit_peer,
+        })
+    }
+
+    pub fn config_service_ipv4(&self) -> Ipv4Addr {
+        self.dns_servers
+            .iter()
+            .find_map(|ip| match ip {
+                IpAddr::V4(ipv4) => Some(*ipv4),
+                IpAddr::V6(_) => None,
+            })
+            .unwrap_or(DEFAULT_CONFIG_SERVICE_IPV4)
+    }
+
+    pub fn supports_ipv6(&self) -> bool {
+        self.addresses.iter().any(IpNetwork::is_ipv6)
+    }
+
+    pub fn is_multihop(&self) -> bool {
+        self.exit_peer.is_some()
+    }
+
+    pub fn exit_peer(&self) -> &PeerSettings {
+        self.exit_peer.as_ref().unwrap_or(&self.entry_peer)
+    }
+
+    pub fn peers(&self) -> impl Iterator<Item = &PeerSettings> {
+        self.exit_peer
+            .as_ref()
+            .into_iter()
+            .chain(std::iter::once(&self.entry_peer))
+    }
+
+    pub fn effective_allowed_ips(&self) -> Vec<IpNetwork> {
+        let enable_ipv6 = self.supports_ipv6();
+        self.peers()
+            .flat_map(|peer| peer.allowed_ips.iter().copied())
+            .filter(|network| network.is_ipv4() || enable_ipv6)
+            .collect()
+    }
+
+    pub fn initial_settings(&self) -> Result<CString> {
+        build_userspace_config(&self.private_key, self.fwmark, self.peers().cloned())
+    }
+
+    pub fn daita_settings(
+        &self,
+        private_key: &PrivateKey,
+        preshared_key: Option<&PresharedKey>,
+    ) -> Result<CString> {
+        build_userspace_config(
+            private_key,
+            self.fwmark,
+            self.peers().map(|peer| {
+                if peer.public_key == self.entry_peer.public_key {
+                    let mut peer = peer.clone();
+                    peer.preshared_key = preshared_key.cloned();
+                    peer.constant_packet_size = true;
+                    peer
+                } else {
+                    let mut peer = peer.clone();
+                    peer.preshared_key = preshared_key
+                        .filter(|_| self.exit_peer.is_none())
+                        .cloned()
+                        .or_else(|| peer.preshared_key.clone());
+                    peer
+                }
+            }),
+        )
+    }
+
+    pub fn multihop_daita_settings(
+        &self,
+        private_key: &PrivateKey,
+        entry_preshared_key: Option<&PresharedKey>,
+        exit_preshared_key: Option<&PresharedKey>,
+    ) -> Result<CString> {
+        build_userspace_config(
+            private_key,
+            self.fwmark,
+            self.peers().map(|peer| {
+                let mut peer = peer.clone();
+                if peer.public_key == self.entry_peer.public_key {
+                    peer.preshared_key = entry_preshared_key.cloned();
+                    peer.constant_packet_size = true;
+                } else if peer.public_key == self.exit_peer().public_key {
+                    peer.preshared_key = exit_preshared_key.cloned();
+                }
+                peer
+            }),
+        )
+    }
+
+    pub fn entry_hop_config_for_ephemeral_exchange(&self) -> Result<CString> {
+        let mut entry_peer = self.entry_peer.clone();
+        let gateway = IpNetwork::from(IpAddr::V4(self.config_service_ipv4()));
+        if !entry_peer.allowed_ips.contains(&gateway) {
+            entry_peer.allowed_ips.push(gateway);
+        }
+
+        build_userspace_config(&self.private_key, self.fwmark, std::iter::once(entry_peer))
+    }
+}
+
+fn build_userspace_config<I>(
+    private_key: &PrivateKey,
+    fwmark: Option<u32>,
+    peers: I,
+) -> Result<CString>
+where
+    I: IntoIterator<Item = PeerSettings>,
+{
+    let mut lines = Vec::new();
+    lines.push(conf_line(
+        "private_key",
+        &hex::encode(private_key.to_bytes()),
+    ));
+    lines.push(conf_line("listen_port", "0"));
+    if let Some(fwmark) = fwmark {
+        lines.push(conf_line("fwmark", &fwmark.to_string()));
+    }
+    lines.push(conf_line("replace_peers", "true"));
+
+    let mut peer_count = 0usize;
+    for peer in peers {
+        let allowed_ips = peer.allowed_ips;
+        if allowed_ips.is_empty() {
+            bail!("peer {} has no allowed IPs", peer.public_key.to_base64());
+        }
+
+        peer_count += 1;
+        lines.push(conf_line(
+            "public_key",
+            &hex::encode(peer.public_key.as_bytes()),
+        ));
+        lines.push(conf_line("endpoint", &peer.endpoint.to_string()));
+        lines.push(conf_line("replace_allowed_ips", "true"));
+        if let Some(preshared_key) = peer.preshared_key.as_ref() {
+            lines.push(conf_line(
+                "preshared_key",
+                &hex::encode(preshared_key.as_bytes()),
+            ));
+        }
+        if let Some(persistent_keepalive) = peer.persistent_keepalive {
+            lines.push(conf_line(
+                "persistent_keepalive_interval",
+                &persistent_keepalive.to_string(),
+            ));
+        }
+        for allowed_ip in &allowed_ips {
+            lines.push(conf_line("allowed_ip", &allowed_ip.to_string()));
+        }
+        if peer.constant_packet_size {
+            lines.push(conf_line("constant_packet_size", "true"));
+        }
+    }
+
+    if peer_count == 0 {
+        bail!("WireGuard config must contain at least one peer");
+    }
+
+    lines.push(String::new());
+
+    CString::new(lines.join("\n")).context("failed to build userspace WireGuard config")
+}
+
+#[derive(Default)]
+struct PendingPeer {
+    public_key: Option<PublicKey>,
+    endpoint: Option<SocketAddr>,
+    allowed_ips: Vec<IpNetwork>,
+    preshared_key: Option<PresharedKey>,
+    persistent_keepalive: Option<u16>,
+}
+
+impl PendingPeer {
+    fn finish(self) -> Result<PeerSettings> {
+        Ok(PeerSettings {
+            public_key: self
+                .public_key
+                .ok_or_else(|| anyhow!("missing Peer.PublicKey"))?,
+            endpoint: self
+                .endpoint
+                .ok_or_else(|| anyhow!("missing Peer.Endpoint"))?,
+            allowed_ips: if self.allowed_ips.is_empty() {
+                bail!("missing Peer.AllowedIPs");
+            } else {
+                self.allowed_ips
+            },
+            preshared_key: self.preshared_key,
+            persistent_keepalive: self.persistent_keepalive,
+            constant_packet_size: false,
+        })
+    }
+}
+
+fn classify_peers(peers: Vec<PeerSettings>) -> Result<(PeerSettings, Option<PeerSettings>)> {
+    match peers.len() {
+        0 => bail!("WireGuard config must contain at least one [Peer] section"),
+        1 => Ok((peers.into_iter().next().unwrap(), None)),
+        2 => {
+            let mut iter = peers.into_iter();
+            let first = iter.next().unwrap();
+            let second = iter.next().unwrap();
+
+            let first_is_exit = peer_looks_like_exit(&first);
+            let second_is_exit = peer_looks_like_exit(&second);
+
+            let (entry_peer, exit_peer) = match (first_is_exit, second_is_exit) {
+                (true, false) => (second, first),
+                (false, true) => (first, second),
+                _ => {
+                    bail!("multihop config must contain exactly one exit peer with a default route")
+                }
+            };
+
+            let exit_endpoint_route = IpNetwork::from(exit_peer.endpoint.ip());
+            if !entry_peer.allowed_ips.contains(&exit_endpoint_route) {
+                bail!(
+                    "multihop config entry peer must route the exit endpoint {}",
+                    exit_peer.endpoint.ip()
+                );
+            }
+
+            Ok((entry_peer, Some(exit_peer)))
+        }
+        _ => bail!("configs with more than two peers are not supported"),
+    }
+}
+
+fn peer_looks_like_exit(peer: &PeerSettings) -> bool {
+    peer.allowed_ips.iter().any(|network| network.prefix() == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PeerSettings, classify_peers};
+    use ipnetwork::IpNetwork;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use talpid_types::net::wireguard::PublicKey;
+
+    fn peer(endpoint: Ipv4Addr, allowed_ips: &[IpNetwork]) -> PeerSettings {
+        PeerSettings {
+            public_key: PublicKey::from([endpoint.octets()[3]; 32]),
+            endpoint: SocketAddr::new(IpAddr::V4(endpoint), 51820),
+            allowed_ips: allowed_ips.to_vec(),
+            preshared_key: None,
+            persistent_keepalive: None,
+            constant_packet_size: false,
+        }
+    }
+
+    #[test]
+    fn classifies_single_hop_peer() {
+        let input = vec![peer(
+            Ipv4Addr::new(185, 65, 135, 1),
+            &[IpNetwork::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()],
+        )];
+
+        let (entry_peer, exit_peer) = classify_peers(input).unwrap();
+
+        assert_eq!(
+            entry_peer.endpoint.ip(),
+            IpAddr::V4(Ipv4Addr::new(185, 65, 135, 1))
+        );
+        assert!(exit_peer.is_none());
+    }
+
+    #[test]
+    fn classifies_multihop_peers_by_default_route_and_exit_endpoint() {
+        let exit_endpoint = Ipv4Addr::new(185, 65, 135, 10);
+        let entry_endpoint = Ipv4Addr::new(146, 70, 1, 20);
+
+        let input = vec![
+            peer(
+                entry_endpoint,
+                &[IpNetwork::new(IpAddr::V4(exit_endpoint), 32).unwrap()],
+            ),
+            peer(
+                exit_endpoint,
+                &[IpNetwork::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()],
+            ),
+        ];
+
+        let (entry_peer, exit_peer) = classify_peers(input).unwrap();
+        let exit_peer = exit_peer.unwrap();
+
+        assert_eq!(entry_peer.endpoint.ip(), IpAddr::V4(entry_endpoint));
+        assert_eq!(exit_peer.endpoint.ip(), IpAddr::V4(exit_endpoint));
+    }
+
+    #[test]
+    fn rejects_invalid_multihop_shape() {
+        let input = vec![
+            peer(
+                Ipv4Addr::new(185, 65, 135, 10),
+                &[IpNetwork::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()],
+            ),
+            peer(
+                Ipv4Addr::new(146, 70, 1, 20),
+                &[IpNetwork::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()],
+            ),
+        ];
+
+        let error = classify_peers(input).unwrap_err().to_string();
+        assert!(error.contains("exactly one exit peer"));
+    }
+}
+
+fn conf_line(key: &str, value: &str) -> String {
+    format!("{key}={value}")
+}
+
+fn parse_ip_list(value: &str) -> Result<Vec<IpAddr>> {
+    value
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .parse::<IpAddr>()
+                .with_context(|| format!("invalid IP address {}", item.trim()))
+        })
+        .collect()
+}
+
+fn parse_interface_networks(value: &str) -> Result<Vec<IpNetwork>> {
+    value
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .parse::<IpNetwork>()
+                .with_context(|| format!("invalid interface network {}", item.trim()))
+        })
+        .collect()
+}
+
+fn parse_network_list(value: &str) -> Result<Vec<IpNetwork>> {
+    value
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .parse::<IpNetwork>()
+                .with_context(|| format!("invalid network {}", item.trim()))
+        })
+        .collect()
+}
+
+fn parse_preshared_key(value: &str) -> Result<PresharedKey> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .context("invalid base64 in preshared key")?;
+    if decoded.len() != 32 {
+        bail!("expected 32 bytes in preshared key, got {}", decoded.len());
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&decoded);
+    Ok(PresharedKey::from(Box::new(bytes)))
+}
+
+fn strip_comments(line: &str) -> &str {
+    let mut cut_at = line.len();
+    for marker in ['#', ';'] {
+        if let Some(index) = line.find(marker) {
+            cut_at = cut_at.min(index);
+        }
+    }
+    &line[..cut_at]
+}
