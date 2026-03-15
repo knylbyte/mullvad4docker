@@ -122,6 +122,13 @@ impl Controller {
         let mut tun_config = tun::Configuration::default();
         tun_config.tun_name(&self.runtime.interface_name);
         tun_config.mtu(self.config.mtu);
+        #[cfg(target_os = "linux")]
+        tun_config.platform_config(|config| {
+            #[allow(deprecated)]
+            {
+                config.packet_information(true);
+            }
+        });
 
         let device = tun::create(&tun_config).context("failed to create TUN device")?;
         let actual_name = device
