@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use mullvad_daita_controller::config::ParsedConfig;
 use mullvad_daita_controller::killswitch;
+use reqwest::Client;
 use std::env;
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
@@ -8,14 +9,21 @@ use std::net::IpAddr;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 use talpid_tunnel_config_client::request_ephemeral_peer;
 use talpid_types::net::wireguard::PrivateKey;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::sleep;
 use tun::AbstractDevice;
 use wireguard_go_rs::{LoggingContext, Tunnel, WgLogLevel};
 
 const DAITA_EVENTS_CAPACITY: u32 = 2048;
 const DAITA_ACTIONS_CAPACITY: u32 = 1024;
+const MULLVAD_CONNECTION_TEST_URL: &str = "https://am.i.mullvad.net/connected";
+const MULLVAD_CONNECTION_SUCCESS_TEXT: &str = "You are connected to Mullvad";
+const MULLVAD_CONNECTION_TEST_ATTEMPTS: u32 = 6;
+const MULLVAD_CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MULLVAD_CONNECTION_TEST_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 struct RuntimeConfig {
@@ -107,6 +115,7 @@ impl Controller {
             self.install_killswitch()?;
         }
         self.run_hooks("PostUp", &self.config.hooks.post_up)?;
+        self.verify_mullvad_connection().await?;
         self.post_up_completed = true;
 
         if self.runtime.daita_enabled {
@@ -295,6 +304,71 @@ impl Controller {
                 .turn_off()
                 .map_err(|error| anyhow!("failed to stop wireguard-go tunnel: {error}"))?;
         }
+        Ok(())
+    }
+
+    async fn verify_mullvad_connection(&self) -> Result<()> {
+        let client = Client::builder()
+            .timeout(MULLVAD_CONNECTION_TEST_TIMEOUT)
+            .user_agent(concat!("mullvad4docker/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("failed to create HTTP client for Mullvad connection test")?;
+
+        let mut last_error = None;
+        for attempt in 1..=MULLVAD_CONNECTION_TEST_ATTEMPTS {
+            match self.try_mullvad_connection_check(&client).await {
+                Ok(()) => {
+                    log::info!("Mullvad connection test passed");
+                    return Ok(());
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Mullvad connection test attempt {}/{} failed: {}",
+                        attempt,
+                        MULLVAD_CONNECTION_TEST_ATTEMPTS,
+                        error
+                    );
+                    last_error = Some(error);
+                    if attempt < MULLVAD_CONNECTION_TEST_ATTEMPTS {
+                        sleep(MULLVAD_CONNECTION_TEST_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("Mullvad connection test failed")))
+    }
+
+    async fn try_mullvad_connection_check(&self, client: &Client) -> Result<()> {
+        let response = client
+            .get(MULLVAD_CONNECTION_TEST_URL)
+            .send()
+            .await
+            .context("failed to request Mullvad connection test page")?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .context("failed to read Mullvad connection test response body")?;
+        let body = String::from_utf8_lossy(&body);
+        let normalized_body = normalize_response_body(&body);
+
+        log::info!("Mullvad connection test response: {}", normalized_body);
+
+        if !status.is_success() {
+            bail!(
+                "Mullvad connection test returned HTTP {} with body: {}",
+                status,
+                normalized_body
+            );
+        }
+        if !is_mullvad_connection_confirmed(&body) {
+            bail!(
+                "unexpected Mullvad connection test response: {}",
+                normalized_body
+            );
+        }
+
         Ok(())
     }
 
@@ -522,6 +596,14 @@ fn run_ip<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<()> {
     Ok(())
 }
 
+fn is_mullvad_connection_confirmed(body: &str) -> bool {
+    body.contains(MULLVAD_CONNECTION_SUCCESS_TEXT)
+}
+
+fn normalize_response_body(body: &str) -> String {
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 async fn wait_for_signal() -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("failed to register SIGINT")?;
     let mut sigterm = signal(SignalKind::terminate()).context("failed to register SIGTERM")?;
@@ -558,4 +640,31 @@ unsafe extern "system" fn wireguard_log_callback(
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     Controller::new().await?.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_mullvad_connection_confirmed, normalize_response_body};
+
+    #[test]
+    fn accepts_connected_response() {
+        assert!(is_mullvad_connection_confirmed(
+            "You are connected to Mullvad. Your IP address is 1.2.3.4\n"
+        ));
+    }
+
+    #[test]
+    fn rejects_disconnected_response() {
+        assert!(!is_mullvad_connection_confirmed(
+            "You are not connected to Mullvad. Your IP address is 1.2.3.4\n"
+        ));
+    }
+
+    #[test]
+    fn normalizes_whitespace_for_logging() {
+        assert_eq!(
+            normalize_response_body("You are connected\n  to Mullvad.\t"),
+            "You are connected to Mullvad."
+        );
+    }
 }

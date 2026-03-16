@@ -50,6 +50,7 @@ The controller:
 - configures addresses and routes directly with `ip`
 - rewrites `/etc/resolv.conf` from `DNS` entries while the tunnel is up
 - executes `PreUp`, `PostUp`, `PreDown`, `PostDown` hooks with `%i` replaced by `WG_INTERFACE`
+- verifies `https://am.i.mullvad.net/connected` before declaring startup successful and aborts if the response does not contain `You are connected to Mullvad`
 - can install an additional container-local kill switch with `iptables`/`ip6tables`
 
 When `KILLSWITCH_ENABLED=true`, the controller installs OUTPUT rules inside the container namespace that:
