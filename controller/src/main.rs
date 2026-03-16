@@ -27,6 +27,9 @@ const MULLVAD_CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MULLVAD_CONNECTION_TEST_RETRY_DELAY: Duration = Duration::from_secs(5);
 const EPHEMERAL_PEER_ATTEMPTS: u32 = 6;
 const EPHEMERAL_PEER_RETRY_DELAY: Duration = Duration::from_secs(2);
+const INITIAL_EPHEMERAL_PEER_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_EPHEMERAL_PEER_TIMEOUT: Duration = Duration::from_secs(48);
+const EPHEMERAL_PEER_TIMEOUT_MULTIPLIER: u32 = 2;
 const GOTATUN_BIN: &str = "gotatun";
 const GOTATUN_SOCKET_DIR: &str = "/var/run/wireguard";
 const GOTATUN_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,6 +39,7 @@ const GOTATUN_RUST_LOG: &str = "gotatun=info,gotatun::device::uapi=warn";
 const POLICY_RULE_PRIORITY: u32 = 10000;
 const SUPPRESS_RULE_PRIORITY: u32 = 10001;
 const SRC_VALID_MARK_PATH: &str = "/proc/sys/net/ipv4/conf/all/src_valid_mark";
+const WG_QUICK_RULE_COMMENT_PREFIX: &str = "wg-quick(8) rule for ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequestedBackend {
@@ -113,6 +117,20 @@ impl RouteFamily {
             Self::Ipv4 => "-4",
             Self::Ipv6 => "-6",
         }
+    }
+
+    fn iptables_program(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "iptables",
+            Self::Ipv6 => "ip6tables",
+        }
+    }
+
+    fn matches_ip(self, ip: &IpAddr) -> bool {
+        matches!(
+            (self, ip),
+            (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_))
+        )
     }
 }
 
@@ -399,20 +417,30 @@ impl Controller {
         enable_post_quantum: bool,
         enable_daita: bool,
     ) -> Result<talpid_tunnel_config_client::EphemeralPeer> {
-        let mut last_error = None;
+        let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 1..=EPHEMERAL_PEER_ATTEMPTS {
-            match request_ephemeral_peer(
-                config_service,
-                parent_pubkey.clone(),
-                ephemeral_pubkey.clone(),
-                enable_post_quantum,
-                enable_daita,
+            let timeout = std::cmp::min(
+                MAX_EPHEMERAL_PEER_TIMEOUT,
+                INITIAL_EPHEMERAL_PEER_TIMEOUT
+                    .saturating_mul(EPHEMERAL_PEER_TIMEOUT_MULTIPLIER.saturating_pow(attempt - 1)),
+            );
+
+            match tokio::time::timeout(
+                timeout,
+                request_ephemeral_peer(
+                    config_service,
+                    parent_pubkey.clone(),
+                    ephemeral_pubkey.clone(),
+                    enable_post_quantum,
+                    enable_daita,
+                ),
             )
             .await
             {
-                Ok(response) => return Ok(response),
-                Err(error) => {
+                Ok(Ok(response)) => return Ok(response),
+                Err(_) => {
+                    let error = anyhow!("timed out after {}s", timeout.as_secs());
                     log::warn!(
                         "{} ephemeral peer request attempt {}/{} failed: {}",
                         phase,
@@ -421,6 +449,19 @@ impl Controller {
                         error
                     );
                     last_error = Some(error);
+                    if attempt < EPHEMERAL_PEER_ATTEMPTS {
+                        sleep(EPHEMERAL_PEER_RETRY_DELAY).await;
+                    }
+                }
+                Ok(Err(error)) => {
+                    log::warn!(
+                        "{} ephemeral peer request attempt {}/{} failed: {}",
+                        phase,
+                        attempt,
+                        EPHEMERAL_PEER_ATTEMPTS,
+                        error
+                    );
+                    last_error = Some(error.into());
                     if attempt < EPHEMERAL_PEER_ATTEMPTS {
                         sleep(EPHEMERAL_PEER_RETRY_DELAY).await;
                     }
@@ -755,6 +796,8 @@ impl Controller {
             ensure_src_valid_mark_enabled()?;
         }
 
+        self.install_wg_quick_firewall_rules(&families, fwmark)?;
+
         for family in &families {
             let _ = run_ip(build_policy_suppress_rule_del_args(*family));
             let _ = run_ip(build_policy_mark_rule_del_args(*family, fwmark));
@@ -776,6 +819,8 @@ impl Controller {
             return Ok(());
         };
 
+        self.remove_wg_quick_firewall_rules(&state.families, state.fwmark);
+
         for family in state.families.iter().copied() {
             let _ = run_ip(build_policy_suppress_rule_del_args(family));
             let _ = run_ip(build_policy_mark_rule_del_args(family, state.fwmark));
@@ -787,6 +832,88 @@ impl Controller {
         }
 
         Ok(())
+    }
+
+    fn install_wg_quick_firewall_rules(&self, families: &[RouteFamily], fwmark: u32) -> Result<()> {
+        for family in families.iter().copied() {
+            self.remove_wg_quick_firewall_rules_for_family(family, fwmark);
+
+            for address in self
+                .config
+                .addresses
+                .iter()
+                .filter(|address| family.matches_ip(&address.ip()))
+            {
+                run_firewall(
+                    family.iptables_program(),
+                    build_wg_quick_prerouting_drop_add_args(
+                        family,
+                        self.runtime.interface_name.as_str(),
+                        &address.to_string(),
+                    ),
+                )?;
+            }
+
+            run_firewall(
+                family.iptables_program(),
+                build_wg_quick_prerouting_restore_add_args(
+                    family,
+                    self.runtime.interface_name.as_str(),
+                ),
+            )?;
+            run_firewall(
+                family.iptables_program(),
+                build_wg_quick_postrouting_save_add_args(
+                    family,
+                    self.runtime.interface_name.as_str(),
+                    fwmark,
+                ),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn remove_wg_quick_firewall_rules(&self, families: &[RouteFamily], fwmark: u32) {
+        for family in families.iter().copied() {
+            self.remove_wg_quick_firewall_rules_for_family(family, fwmark);
+        }
+    }
+
+    fn remove_wg_quick_firewall_rules_for_family(&self, family: RouteFamily, fwmark: u32) {
+        let program = family.iptables_program();
+
+        let _ = run_firewall(
+            program,
+            build_wg_quick_postrouting_save_del_args(
+                family,
+                self.runtime.interface_name.as_str(),
+                fwmark,
+            ),
+        );
+        let _ = run_firewall(
+            program,
+            build_wg_quick_prerouting_restore_del_args(
+                family,
+                self.runtime.interface_name.as_str(),
+            ),
+        );
+
+        for address in self
+            .config
+            .addresses
+            .iter()
+            .filter(|address| family.matches_ip(&address.ip()))
+        {
+            let _ = run_firewall(
+                program,
+                build_wg_quick_prerouting_drop_del_args(
+                    family,
+                    self.runtime.interface_name.as_str(),
+                    &address.to_string(),
+                ),
+            );
+        }
     }
 
     fn apply_dns(&mut self) -> Result<()> {
@@ -1235,6 +1362,115 @@ fn build_policy_suppress_rule_del_args(family: RouteFamily) -> Vec<String> {
     ]
 }
 
+fn build_wg_quick_rule_comment(interface_name: &str) -> String {
+    format!("{WG_QUICK_RULE_COMMENT_PREFIX}{interface_name}")
+}
+
+fn build_wg_quick_prerouting_drop_add_args(
+    _family: RouteFamily,
+    interface_name: &str,
+    address: &str,
+) -> Vec<String> {
+    vec![
+        "-t".into(),
+        "raw".into(),
+        "-I".into(),
+        "PREROUTING".into(),
+        "!".into(),
+        "-i".into(),
+        interface_name.into(),
+        "-d".into(),
+        address.into(),
+        "-m".into(),
+        "addrtype".into(),
+        "!".into(),
+        "--src-type".into(),
+        "LOCAL".into(),
+        "-m".into(),
+        "comment".into(),
+        "--comment".into(),
+        build_wg_quick_rule_comment(interface_name),
+        "-j".into(),
+        "DROP".into(),
+    ]
+}
+
+fn build_wg_quick_prerouting_drop_del_args(
+    family: RouteFamily,
+    interface_name: &str,
+    address: &str,
+) -> Vec<String> {
+    let mut args = build_wg_quick_prerouting_drop_add_args(family, interface_name, address);
+    args[2] = "-D".into();
+    args
+}
+
+fn build_wg_quick_prerouting_restore_add_args(
+    _family: RouteFamily,
+    interface_name: &str,
+) -> Vec<String> {
+    vec![
+        "-t".into(),
+        "mangle".into(),
+        "-I".into(),
+        "PREROUTING".into(),
+        "-p".into(),
+        "udp".into(),
+        "-m".into(),
+        "comment".into(),
+        "--comment".into(),
+        build_wg_quick_rule_comment(interface_name),
+        "-j".into(),
+        "CONNMARK".into(),
+        "--restore-mark".into(),
+    ]
+}
+
+fn build_wg_quick_prerouting_restore_del_args(
+    family: RouteFamily,
+    interface_name: &str,
+) -> Vec<String> {
+    let mut args = build_wg_quick_prerouting_restore_add_args(family, interface_name);
+    args[2] = "-D".into();
+    args
+}
+
+fn build_wg_quick_postrouting_save_add_args(
+    _family: RouteFamily,
+    interface_name: &str,
+    fwmark: u32,
+) -> Vec<String> {
+    vec![
+        "-t".into(),
+        "mangle".into(),
+        "-I".into(),
+        "POSTROUTING".into(),
+        "-m".into(),
+        "mark".into(),
+        "--mark".into(),
+        fwmark.to_string(),
+        "-p".into(),
+        "udp".into(),
+        "-m".into(),
+        "comment".into(),
+        "--comment".into(),
+        build_wg_quick_rule_comment(interface_name),
+        "-j".into(),
+        "CONNMARK".into(),
+        "--save-mark".into(),
+    ]
+}
+
+fn build_wg_quick_postrouting_save_del_args(
+    family: RouteFamily,
+    interface_name: &str,
+    fwmark: u32,
+) -> Vec<String> {
+    let mut args = build_wg_quick_postrouting_save_add_args(family, interface_name, fwmark);
+    args[2] = "-D".into();
+    args
+}
+
 fn ensure_src_valid_mark_enabled() -> Result<()> {
     let current = fs::read_to_string(SRC_VALID_MARK_PATH)
         .context("failed to read net.ipv4.conf.all.src_valid_mark")?;
@@ -1249,6 +1485,10 @@ fn validate_src_valid_mark_value(current: &str) -> Result<()> {
     bail!(
         "full-tunnel policy routing requires net.ipv4.conf.all.src_valid_mark=1; set it via container sysctls"
     );
+}
+
+fn run_firewall(program: &str, args: Vec<String>) -> Result<()> {
+    run_command(program, args.iter().map(String::as_str))
 }
 
 fn run_ip<I, S>(args: I) -> Result<()>
@@ -1341,10 +1581,13 @@ mod tests {
         SUPPRESS_RULE_PRIORITY, build_policy_default_route_args,
         build_policy_default_route_del_args, build_policy_mark_rule_add_args,
         build_policy_mark_rule_del_args, build_policy_suppress_rule_add_args,
-        build_policy_suppress_rule_del_args, format_gotatun_log_line, format_log_timestamp,
-        gotatun_socket_path, interface_exists, is_mullvad_connection_confirmed,
-        normalize_gotatun_timestamp, normalize_response_body, resolve_backend, strip_ansi_escapes,
-        validate_src_valid_mark_value,
+        build_policy_suppress_rule_del_args, build_wg_quick_postrouting_save_add_args,
+        build_wg_quick_postrouting_save_del_args, build_wg_quick_prerouting_drop_add_args,
+        build_wg_quick_prerouting_drop_del_args, build_wg_quick_prerouting_restore_add_args,
+        build_wg_quick_prerouting_restore_del_args, build_wg_quick_rule_comment,
+        format_gotatun_log_line, format_log_timestamp, gotatun_socket_path, interface_exists,
+        is_mullvad_connection_confirmed, normalize_gotatun_timestamp, normalize_response_body,
+        resolve_backend, strip_ansi_escapes, validate_src_valid_mark_value,
     };
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Local};
@@ -1597,5 +1840,143 @@ mod tests {
             .to_string();
         assert!(error.contains("src_valid_mark=1"));
         assert!(error.contains("container sysctls"));
+    }
+
+    #[test]
+    fn builds_wg_quick_firewall_commands() {
+        assert_eq!(
+            build_wg_quick_rule_comment("wg0"),
+            "wg-quick(8) rule for wg0"
+        );
+        assert_eq!(
+            build_wg_quick_prerouting_drop_add_args(RouteFamily::Ipv4, "wg0", "10.0.0.2/32"),
+            vec![
+                "-t",
+                "raw",
+                "-I",
+                "PREROUTING",
+                "!",
+                "-i",
+                "wg0",
+                "-d",
+                "10.0.0.2/32",
+                "-m",
+                "addrtype",
+                "!",
+                "--src-type",
+                "LOCAL",
+                "-m",
+                "comment",
+                "--comment",
+                "wg-quick(8) rule for wg0",
+                "-j",
+                "DROP"
+            ]
+        );
+        assert_eq!(
+            build_wg_quick_prerouting_drop_del_args(RouteFamily::Ipv4, "wg0", "10.0.0.2/32"),
+            vec![
+                "-t",
+                "raw",
+                "-D",
+                "PREROUTING",
+                "!",
+                "-i",
+                "wg0",
+                "-d",
+                "10.0.0.2/32",
+                "-m",
+                "addrtype",
+                "!",
+                "--src-type",
+                "LOCAL",
+                "-m",
+                "comment",
+                "--comment",
+                "wg-quick(8) rule for wg0",
+                "-j",
+                "DROP"
+            ]
+        );
+        assert_eq!(
+            build_wg_quick_prerouting_restore_add_args(RouteFamily::Ipv4, "wg0"),
+            vec![
+                "-t",
+                "mangle",
+                "-I",
+                "PREROUTING",
+                "-p",
+                "udp",
+                "-m",
+                "comment",
+                "--comment",
+                "wg-quick(8) rule for wg0",
+                "-j",
+                "CONNMARK",
+                "--restore-mark"
+            ]
+        );
+        assert_eq!(
+            build_wg_quick_prerouting_restore_del_args(RouteFamily::Ipv4, "wg0"),
+            vec![
+                "-t",
+                "mangle",
+                "-D",
+                "PREROUTING",
+                "-p",
+                "udp",
+                "-m",
+                "comment",
+                "--comment",
+                "wg-quick(8) rule for wg0",
+                "-j",
+                "CONNMARK",
+                "--restore-mark"
+            ]
+        );
+        assert_eq!(
+            build_wg_quick_postrouting_save_add_args(RouteFamily::Ipv4, "wg0", 51820),
+            vec![
+                "-t",
+                "mangle",
+                "-I",
+                "POSTROUTING",
+                "-m",
+                "mark",
+                "--mark",
+                "51820",
+                "-p",
+                "udp",
+                "-m",
+                "comment",
+                "--comment",
+                "wg-quick(8) rule for wg0",
+                "-j",
+                "CONNMARK",
+                "--save-mark"
+            ]
+        );
+        assert_eq!(
+            build_wg_quick_postrouting_save_del_args(RouteFamily::Ipv4, "wg0", 51820),
+            vec![
+                "-t",
+                "mangle",
+                "-D",
+                "POSTROUTING",
+                "-m",
+                "mark",
+                "--mark",
+                "51820",
+                "-p",
+                "udp",
+                "-m",
+                "comment",
+                "--comment",
+                "wg-quick(8) rule for wg0",
+                "-j",
+                "CONNMARK",
+                "--save-mark"
+            ]
+        );
     }
 }
