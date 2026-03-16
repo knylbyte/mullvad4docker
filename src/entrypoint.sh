@@ -7,6 +7,7 @@ DANTE_ENABLED="${DANTE_ENABLED:-false}"
 WG_INTERFACE="${WG_INTERFACE:-wg0}"
 WG_CONFIG_FILE="${WG_CONFIG_FILE:-/etc/wireguard/${WG_INTERFACE}.conf}"
 DANTE_CONFIG="/etc/dante/sockd.conf"
+DANTE_BIN="/usr/sbin/danted"
 CONTROLLER_BIN="/usr/local/bin/mullvad-daita-controller"
 
 DANTE_PID=""
@@ -50,6 +51,7 @@ require_prerequisites() {
 
 verify_dante_config() {
     [ -f "$DANTE_CONFIG" ] || fail "missing Dante config: $DANTE_CONFIG"
+    [ -x "$DANTE_BIN" ] || fail "missing Dante binary: $DANTE_BIN"
     awk -v interface_name="$WG_INTERFACE" '
         function trim(value) {
             sub(/^[[:space:]]+/, "", value)
@@ -95,7 +97,7 @@ start_dante() {
         true|TRUE|1|yes|YES)
             verify_dante_config
             log "starting Dante with $DANTE_CONFIG"
-            sockd -f "$DANTE_CONFIG" &
+            "$DANTE_BIN" -f "$DANTE_CONFIG" &
             DANTE_PID="$!"
             ;;
         false|FALSE|0|no|NO)
