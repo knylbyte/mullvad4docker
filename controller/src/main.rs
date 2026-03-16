@@ -25,6 +25,8 @@ const MULLVAD_CONNECTION_SUCCESS_TEXT: &str = "You are connected to Mullvad";
 const MULLVAD_CONNECTION_TEST_ATTEMPTS: u32 = 6;
 const MULLVAD_CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MULLVAD_CONNECTION_TEST_RETRY_DELAY: Duration = Duration::from_secs(5);
+const EPHEMERAL_PEER_ATTEMPTS: u32 = 6;
+const EPHEMERAL_PEER_RETRY_DELAY: Duration = Duration::from_secs(2);
 const GOTATUN_BIN: &str = "gotatun";
 const GOTATUN_SOCKET_DIR: &str = "/var/run/wireguard";
 const GOTATUN_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -333,15 +335,16 @@ impl Controller {
     async fn activate_daita_userspace(&mut self) -> Result<()> {
         let config_service = self.config.config_service_ipv4();
         let ephemeral_private_key = PrivateKey::new_from_random();
-        let exit_response = request_ephemeral_peer(
-            config_service,
-            self.config.private_key.public_key(),
-            ephemeral_private_key.public_key(),
-            false,
-            !self.config.is_multihop(),
-        )
-        .await
-        .map_err(|error| anyhow!("failed to request exit ephemeral peer: {error}"))?;
+        let exit_response = self
+            .request_ephemeral_peer_with_retries(
+                "exit",
+                config_service,
+                self.config.private_key.public_key(),
+                ephemeral_private_key.public_key(),
+                false,
+                !self.config.is_multihop(),
+            )
+            .await?;
 
         let settings = if self.config.is_multihop() {
             let entry_only_settings = self.config.entry_hop_uapi_request()?;
@@ -349,15 +352,16 @@ impl Controller {
             self.restart_userspace_tunnel(&entry_only_settings)?;
             self.configure_interface_without_dns()?;
 
-            let entry_response = request_ephemeral_peer(
-                config_service,
-                self.config.private_key.public_key(),
-                ephemeral_private_key.public_key(),
-                false,
-                true,
-            )
-            .await
-            .map_err(|error| anyhow!("failed to request entry ephemeral peer: {error}"))?;
+            let entry_response = self
+                .request_ephemeral_peer_with_retries(
+                    "entry",
+                    config_service,
+                    self.config.private_key.public_key(),
+                    ephemeral_private_key.public_key(),
+                    false,
+                    true,
+                )
+                .await?;
 
             let daita = entry_response
                 .daita
@@ -383,6 +387,53 @@ impl Controller {
         self.restart_userspace_tunnel(&settings)
             .context("failed to apply DAITA reconfiguration to gotatun")?;
         Ok(())
+    }
+
+    async fn request_ephemeral_peer_with_retries(
+        &self,
+        phase: &str,
+        config_service: std::net::Ipv4Addr,
+        parent_pubkey: talpid_types::net::wireguard::PublicKey,
+        ephemeral_pubkey: talpid_types::net::wireguard::PublicKey,
+        enable_post_quantum: bool,
+        enable_daita: bool,
+    ) -> Result<talpid_tunnel_config_client::EphemeralPeer> {
+        let mut last_error = None;
+
+        for attempt in 1..=EPHEMERAL_PEER_ATTEMPTS {
+            match request_ephemeral_peer(
+                config_service,
+                parent_pubkey.clone(),
+                ephemeral_pubkey.clone(),
+                enable_post_quantum,
+                enable_daita,
+            )
+            .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    log::warn!(
+                        "{} ephemeral peer request attempt {}/{} failed: {}",
+                        phase,
+                        attempt,
+                        EPHEMERAL_PEER_ATTEMPTS,
+                        error
+                    );
+                    last_error = Some(error);
+                    if attempt < EPHEMERAL_PEER_ATTEMPTS {
+                        sleep(EPHEMERAL_PEER_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "failed to request {} ephemeral peer: {}",
+            phase,
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 
     fn restart_userspace_tunnel(&mut self, request: &str) -> Result<()> {
