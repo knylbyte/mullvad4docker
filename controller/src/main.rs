@@ -197,10 +197,11 @@ impl Controller {
     }
 
     async fn bootstrap(&mut self) -> Result<()> {
+        log::info!("starting tunnel controller");
+        log::info!("interface: {}", self.runtime.interface_name);
+        log::info!("config: {}", self.runtime.config_file.display());
         log::info!(
-            "starting tunnel controller with interface {}, config {}, requested backend {}, effective backend {}",
-            self.runtime.interface_name,
-            self.runtime.config_file.display(),
+            "backend: requested={}, effective={}",
             self.runtime.requested_backend.as_str(),
             self.backend.as_str()
         );
