@@ -187,10 +187,7 @@ fn connect_probe_socket(entry_endpoint: SocketAddr) -> Result<UdpSocket> {
 
 fn configure_path_mtu_discovery(socket: &UdpSocket, remote_ip: IpAddr) -> Result<()> {
     let fd = socket.as_raw_fd();
-    let (level, option) = match remote_ip {
-        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER),
-        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER),
-    };
+    let (level, option) = path_mtu_discover_socketopt(remote_ip)?;
 
     let result = unsafe {
         libc::setsockopt(
@@ -213,10 +210,7 @@ fn current_path_mtu(socket: &UdpSocket, remote_ip: IpAddr) -> Result<u16> {
     let fd = socket.as_raw_fd();
     let mut value: libc::c_int = 0;
     let mut len = mem::size_of_val(&value) as libc::socklen_t;
-    let (level, option) = match remote_ip {
-        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_MTU),
-        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_MTU),
-    };
+    let (level, option) = current_path_mtu_socketopt(remote_ip)?;
 
     let result = unsafe {
         libc::getsockopt(
@@ -271,6 +265,32 @@ fn candidate_points(low: u16, high: u16, workers: usize) -> Vec<u16> {
         }
     }
     points
+}
+
+#[cfg(target_os = "linux")]
+fn path_mtu_discover_socketopt(remote_ip: IpAddr) -> Result<(libc::c_int, libc::c_int)> {
+    Ok(match remote_ip {
+        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER),
+        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn path_mtu_discover_socketopt(_remote_ip: IpAddr) -> Result<(libc::c_int, libc::c_int)> {
+    bail!("auto MTU probing is only supported on Linux");
+}
+
+#[cfg(target_os = "linux")]
+fn current_path_mtu_socketopt(remote_ip: IpAddr) -> Result<(libc::c_int, libc::c_int)> {
+    Ok(match remote_ip {
+        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_MTU),
+        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_MTU),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_path_mtu_socketopt(_remote_ip: IpAddr) -> Result<(libc::c_int, libc::c_int)> {
+    bail!("auto MTU probing is only supported on Linux");
 }
 
 #[cfg(test)]

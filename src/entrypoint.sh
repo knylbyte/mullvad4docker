@@ -43,7 +43,6 @@ trap 'cleanup $?' EXIT
 trap 'exit 0' INT TERM
 
 require_prerequisites() {
-    [ -c /dev/net/tun ] || fail "missing /dev/net/tun"
     [ -f "$WG_CONFIG_FILE" ] || fail "missing WireGuard config: $WG_CONFIG_FILE"
     [ -x "$CONTROLLER_BIN" ] || fail "missing controller binary: $CONTROLLER_BIN"
     command -v ip >/dev/null 2>&1 || fail "ip not found"

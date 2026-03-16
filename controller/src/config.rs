@@ -243,6 +243,10 @@ impl ParsedConfig {
         build_userspace_config(&self.private_key, self.fwmark, self.peers().cloned())
     }
 
+    pub fn kernel_settings(&self) -> String {
+        build_kernel_config(&self.private_key, self.fwmark, self.peers().cloned())
+    }
+
     pub fn daita_settings(
         &self,
         private_key: &PrivateKey,
@@ -362,6 +366,45 @@ where
     lines.push(String::new());
 
     CString::new(lines.join("\n")).context("failed to build userspace WireGuard config")
+}
+
+fn build_kernel_config<I>(private_key: &PrivateKey, fwmark: Option<u32>, peers: I) -> String
+where
+    I: IntoIterator<Item = PeerSettings>,
+{
+    let mut lines = Vec::new();
+    lines.push("[Interface]".to_string());
+    lines.push(format!("PrivateKey = {}", private_key.to_base64()));
+    if let Some(fwmark) = fwmark {
+        lines.push(format!("FwMark = {}", fwmark));
+    }
+    lines.push(String::new());
+
+    for peer in peers {
+        lines.push("[Peer]".to_string());
+        lines.push(format!("PublicKey = {}", peer.public_key.to_base64()));
+        lines.push(format!("Endpoint = {}", peer.endpoint));
+        if let Some(preshared_key) = peer.preshared_key.as_ref() {
+            lines.push(format!(
+                "PresharedKey = {}",
+                base64::engine::general_purpose::STANDARD.encode(preshared_key.as_bytes())
+            ));
+        }
+        if let Some(persistent_keepalive) = peer.persistent_keepalive {
+            lines.push(format!("PersistentKeepalive = {}", persistent_keepalive));
+        }
+        lines.push(format!(
+            "AllowedIPs = {}",
+            peer.allowed_ips
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
 }
 
 #[derive(Default)]
@@ -525,6 +568,36 @@ mod tests {
 
         let config = ParsedConfig::from_file(&path).unwrap();
         assert!(matches!(config.mtu, InterfaceMtu::Auto));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn renders_kernel_settings_for_supported_fields() {
+        let path = write_temp_config(
+            "[Interface]\n\
+             PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+             Address = 10.0.0.2/32\n\
+             FwMark = 1234\n\
+             \n\
+             [Peer]\n\
+             PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n\
+             Endpoint = 198.51.100.1:51820\n\
+             AllowedIPs = 0.0.0.0/0, ::/0\n\
+             PersistentKeepalive = 25\n",
+        );
+
+        let config = ParsedConfig::from_file(&path).unwrap();
+        let rendered = config.kernel_settings();
+
+        assert!(rendered.contains("[Interface]"));
+        assert!(rendered.contains("PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+        assert!(rendered.contains("FwMark = 1234"));
+        assert!(rendered.contains("[Peer]"));
+        assert!(rendered.contains("PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="));
+        assert!(rendered.contains("Endpoint = 198.51.100.1:51820"));
+        assert!(rendered.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
+        assert!(rendered.contains("PersistentKeepalive = 25"));
 
         let _ = fs::remove_file(path);
     }

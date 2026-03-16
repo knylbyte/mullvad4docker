@@ -9,10 +9,11 @@ use std::fs;
 use std::net::IpAddr;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{self, Command};
 use std::time::Duration;
 use talpid_tunnel_config_client::request_ephemeral_peer;
 use talpid_types::net::wireguard::PrivateKey;
+use tempfile::NamedTempFile;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
 use tun::AbstractDevice;
@@ -26,12 +27,54 @@ const MULLVAD_CONNECTION_TEST_ATTEMPTS: u32 = 6;
 const MULLVAD_CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MULLVAD_CONNECTION_TEST_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestedBackend {
+    Auto,
+    Userspace,
+    Kernel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectiveBackend {
+    Userspace,
+    Kernel,
+}
+
+impl RequestedBackend {
+    fn from_env_value(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "userspace" => Ok(Self::Userspace),
+            "kernel" => Ok(Self::Kernel),
+            _ => bail!("WG_BACKEND must be auto, userspace, or kernel"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Userspace => "userspace",
+            Self::Kernel => "kernel",
+        }
+    }
+}
+
+impl EffectiveBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Userspace => "userspace",
+            Self::Kernel => "kernel",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeConfig {
     daita_enabled: bool,
     killswitch_enabled: bool,
     interface_name: String,
     config_file: PathBuf,
+    requested_backend: RequestedBackend,
 }
 
 #[derive(Debug)]
@@ -55,10 +98,16 @@ struct SystemState {
     resolv_conf_backup: Option<String>,
 }
 
+enum ActiveTunnel {
+    Userspace(Tunnel),
+    Kernel,
+}
+
 struct Controller {
     runtime: RuntimeConfig,
+    backend: EffectiveBackend,
     config: ParsedConfig,
-    tunnel: Option<Tunnel>,
+    tunnel: Option<ActiveTunnel>,
     system_state: SystemState,
     post_up_completed: bool,
     effective_mtu: u16,
@@ -73,6 +122,9 @@ impl RuntimeConfig {
             config_file: PathBuf::from(
                 env::var("WG_CONFIG_FILE").unwrap_or_else(|_| "/etc/wireguard/wg0.conf".into()),
             ),
+            requested_backend: RequestedBackend::from_env_value(
+                &env::var("WG_BACKEND").unwrap_or_else(|_| "auto".to_string()),
+            )?,
         })
     }
 }
@@ -81,8 +133,13 @@ impl Controller {
     async fn new() -> Result<Self> {
         let runtime = RuntimeConfig::from_env()?;
         let config = ParsedConfig::from_file(&runtime.config_file)?;
+        let backend = resolve_backend(runtime.requested_backend, runtime.daita_enabled, || {
+            probe_kernel_backend()
+        })?;
+
         Ok(Self {
             runtime,
+            backend,
             config,
             tunnel: None,
             system_state: SystemState::default(),
@@ -103,9 +160,11 @@ impl Controller {
 
     async fn bootstrap(&mut self) -> Result<()> {
         log::info!(
-            "starting tunnel controller with interface {} and config {}",
+            "starting tunnel controller with interface {}, config {}, requested backend {}, effective backend {}",
             self.runtime.interface_name,
-            self.runtime.config_file.display()
+            self.runtime.config_file.display(),
+            self.runtime.requested_backend.as_str(),
+            self.backend.as_str()
         );
 
         self.effective_mtu = self.resolve_interface_mtu().await?;
@@ -123,15 +182,30 @@ impl Controller {
         self.post_up_completed = true;
 
         if self.runtime.daita_enabled {
-            log::info!("DAITA activation completed");
+            log::info!(
+                "{} tunnel started and DAITA activation completed",
+                self.backend.as_str()
+            );
         } else {
-            log::info!("tunnel started without DAITA activation");
+            log::info!(
+                "{} tunnel started without DAITA activation",
+                self.backend.as_str()
+            );
         }
 
         Ok(())
     }
 
     fn start_tunnel(&mut self) -> Result<()> {
+        let tunnel = match self.backend {
+            EffectiveBackend::Userspace => self.start_userspace_tunnel()?,
+            EffectiveBackend::Kernel => self.start_kernel_tunnel()?,
+        };
+        self.tunnel = Some(tunnel);
+        Ok(())
+    }
+
+    fn start_userspace_tunnel(&self) -> Result<ActiveTunnel> {
         let mut tun_config = tun::Configuration::default();
         tun_config.tun_name(&self.runtime.interface_name);
         tun_config.mtu(self.effective_mtu);
@@ -167,8 +241,46 @@ impl Controller {
         )
         .map_err(|error| anyhow!("failed to start wireguard-go tunnel: {error}"))?;
 
-        self.tunnel = Some(tunnel);
-        Ok(())
+        Ok(ActiveTunnel::Userspace(tunnel))
+    }
+
+    fn start_kernel_tunnel(&self) -> Result<ActiveTunnel> {
+        run_ip([
+            "link",
+            "add",
+            "dev",
+            self.runtime.interface_name.as_str(),
+            "type",
+            "wireguard",
+        ])?;
+
+        let config_file = self.write_kernel_config_file()?;
+        let apply_result = run_wg([
+            "setconf",
+            self.runtime.interface_name.as_str(),
+            config_file.path().to_string_lossy().as_ref(),
+        ]);
+
+        if let Err(error) = apply_result {
+            let _ = run_ip([
+                "link",
+                "delete",
+                "dev",
+                self.runtime.interface_name.as_str(),
+            ]);
+            return Err(error);
+        }
+
+        Ok(ActiveTunnel::Kernel)
+    }
+
+    fn write_kernel_config_file(&self) -> Result<NamedTempFile> {
+        let mut file =
+            NamedTempFile::new().context("failed to create temporary kernel WireGuard config")?;
+        use std::io::Write;
+        file.write_all(self.config.kernel_settings().as_bytes())
+            .context("failed to write temporary kernel WireGuard config")?;
+        Ok(file)
     }
 
     fn configure_interface(&mut self) -> Result<()> {
@@ -181,6 +293,7 @@ impl Controller {
     }
 
     async fn activate_daita(&mut self) -> Result<()> {
+        let tunnel = self.active_userspace_tunnel()?;
         let config_service = self.config.config_service_ipv4();
         let ephemeral_private_key = PrivateKey::new_from_random();
         let exit_response = request_ephemeral_peer(
@@ -195,13 +308,9 @@ impl Controller {
 
         let (settings, daita_peer_public_key, daita) = if self.config.is_multihop() {
             let entry_only_settings = self.config.entry_hop_config_for_ephemeral_exchange()?;
-            self.tunnel
-                .as_ref()
-                .ok_or_else(|| anyhow!("tunnel is not active"))?
-                .set_config(&entry_only_settings)
-                .map_err(|error| {
-                    anyhow!("failed to reconfigure tunnel for entry ephemeral exchange: {error}")
-                })?;
+            tunnel.set_config(&entry_only_settings).map_err(|error| {
+                anyhow!("failed to reconfigure tunnel for entry ephemeral exchange: {error}")
+            })?;
 
             let entry_response = request_ephemeral_peer(
                 config_service,
@@ -234,9 +343,7 @@ impl Controller {
             (settings, self.config.entry_peer.public_key.clone(), daita)
         };
 
-        self.tunnel
-            .as_ref()
-            .ok_or_else(|| anyhow!("tunnel is not active"))?
+        tunnel
             .set_config(&settings)
             .map_err(|error| anyhow!("failed to reconfigure tunnel for DAITA: {error}"))?;
 
@@ -249,9 +356,7 @@ impl Controller {
         let machines =
             CString::new(machines).context("relay config returned invalid maybenot machines")?;
 
-        self.tunnel
-            .as_ref()
-            .ok_or_else(|| anyhow!("tunnel is not active"))?
+        tunnel
             .activate_daita(
                 daita_peer_public_key.as_bytes(),
                 &machines,
@@ -263,6 +368,16 @@ impl Controller {
             .map_err(|error| anyhow!("failed to activate DAITA: {error}"))?;
 
         Ok(())
+    }
+
+    fn active_userspace_tunnel(&self) -> Result<&Tunnel> {
+        match self.tunnel.as_ref() {
+            Some(ActiveTunnel::Userspace(tunnel)) => Ok(tunnel),
+            Some(ActiveTunnel::Kernel) => {
+                bail!("DAITA is only supported with the userspace backend")
+            }
+            None => bail!("tunnel is not active"),
+        }
     }
 
     fn shutdown(&mut self, startup_failed: bool) -> Result<()> {
@@ -303,10 +418,19 @@ impl Controller {
     }
 
     fn stop_tunnel(&mut self) -> Result<()> {
-        if let Some(tunnel) = self.tunnel.take() {
-            tunnel
+        match self.tunnel.take() {
+            Some(ActiveTunnel::Userspace(tunnel)) => tunnel
                 .turn_off()
-                .map_err(|error| anyhow!("failed to stop wireguard-go tunnel: {error}"))?;
+                .map_err(|error| anyhow!("failed to stop wireguard-go tunnel: {error}"))?,
+            Some(ActiveTunnel::Kernel) => {
+                run_ip([
+                    "link",
+                    "delete",
+                    "dev",
+                    self.runtime.interface_name.as_str(),
+                ])?;
+            }
+            None => {}
         }
         Ok(())
     }
@@ -567,6 +691,64 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
     }
 }
 
+fn resolve_backend<F>(
+    requested: RequestedBackend,
+    daita_enabled: bool,
+    kernel_probe: F,
+) -> Result<EffectiveBackend>
+where
+    F: FnOnce() -> Result<()>,
+{
+    if !cfg!(target_os = "linux") {
+        return match requested {
+            RequestedBackend::Kernel => bail!("kernel backend is only supported on Linux"),
+            RequestedBackend::Auto | RequestedBackend::Userspace => Ok(EffectiveBackend::Userspace),
+        };
+    }
+
+    match requested {
+        RequestedBackend::Userspace => Ok(EffectiveBackend::Userspace),
+        RequestedBackend::Kernel => {
+            if daita_enabled {
+                bail!("DAITA requires the userspace backend; WG_BACKEND=kernel is unsupported");
+            }
+            kernel_probe()?;
+            Ok(EffectiveBackend::Kernel)
+        }
+        RequestedBackend::Auto => {
+            if daita_enabled {
+                log::info!("DAITA is enabled; forcing userspace backend");
+                return Ok(EffectiveBackend::Userspace);
+            }
+
+            match kernel_probe() {
+                Ok(()) => Ok(EffectiveBackend::Kernel),
+                Err(error) => {
+                    log::warn!(
+                        "kernel backend probe failed; falling back to userspace backend: {}",
+                        error
+                    );
+                    Ok(EffectiveBackend::Userspace)
+                }
+            }
+        }
+    }
+}
+
+fn probe_kernel_backend() -> Result<()> {
+    let temp_interface = format!("wgp{}", process::id());
+    run_ip([
+        "link",
+        "add",
+        "dev",
+        temp_interface.as_str(),
+        "type",
+        "wireguard",
+    ])?;
+    run_ip(["link", "delete", "dev", temp_interface.as_str()])?;
+    Ok(())
+}
+
 fn read_default_route(family_flag: &str) -> Result<DefaultRoute> {
     let output = Command::new("ip")
         .arg(family_flag)
@@ -575,9 +757,10 @@ fn read_default_route(family_flag: &str) -> Result<DefaultRoute> {
         .context("failed to query default route")?;
     if !output.status.success() {
         bail!(
-            "ip {} route show default failed with status {}",
+            "ip {} route show default failed with status {}: {}",
             family_flag,
-            output.status
+            output.status,
+            command_error_text(&output.stdout, &output.stderr)
         );
     }
 
@@ -616,16 +799,59 @@ fn read_default_route(family_flag: &str) -> Result<DefaultRoute> {
     })
 }
 
-fn run_ip<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<()> {
-    let args = args.into_iter().collect::<Vec<_>>();
-    let status = Command::new("ip")
+fn run_ip<I, S>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    run_command("ip", args)
+}
+
+fn run_wg<I, S>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    run_command("wg", args)
+}
+
+fn run_command<I, S>(program: &str, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let output = Command::new(program)
         .args(&args)
-        .status()
-        .with_context(|| format!("failed to execute ip {}", args.join(" ")))?;
-    if !status.success() {
-        bail!("ip {} failed with status {}", args.join(" "), status);
+        .output()
+        .with_context(|| format!("failed to execute {} {}", program, args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "{} {} failed with status {}: {}",
+            program,
+            args.join(" "),
+            output.status,
+            command_error_text(&output.stdout, &output.stderr)
+        );
     }
     Ok(())
+}
+
+fn command_error_text(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+
+    "no output".to_string()
 }
 
 fn is_mullvad_connection_confirmed(body: &str) -> bool {
@@ -676,7 +902,73 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_mullvad_connection_confirmed, normalize_response_body};
+    use super::{
+        EffectiveBackend, RequestedBackend, is_mullvad_connection_confirmed,
+        normalize_response_body, resolve_backend,
+    };
+    use anyhow::{Result, anyhow};
+
+    #[test]
+    fn parses_backend_modes() {
+        assert_eq!(
+            RequestedBackend::from_env_value("auto").unwrap(),
+            RequestedBackend::Auto
+        );
+        assert_eq!(
+            RequestedBackend::from_env_value("userspace").unwrap(),
+            RequestedBackend::Userspace
+        );
+        assert_eq!(
+            RequestedBackend::from_env_value("kernel").unwrap(),
+            RequestedBackend::Kernel
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_backend_mode() {
+        let error = RequestedBackend::from_env_value("invalid").unwrap_err();
+        assert!(error.to_string().contains("WG_BACKEND"));
+    }
+
+    #[test]
+    fn rejects_kernel_backend_when_daita_is_enabled() {
+        let error = resolve_backend(RequestedBackend::Kernel, true, || Ok(())).unwrap_err();
+        let error = error.to_string();
+        if cfg!(target_os = "linux") {
+            assert!(error.contains("DAITA requires the userspace backend"));
+        } else {
+            assert!(error.contains("only supported on Linux"));
+        }
+    }
+
+    #[test]
+    fn auto_backend_forces_userspace_when_daita_is_enabled() {
+        let backend = resolve_backend(RequestedBackend::Auto, true, || -> Result<()> {
+            Err(anyhow!("probe should not run"))
+        })
+        .unwrap();
+        assert_eq!(backend, EffectiveBackend::Userspace);
+    }
+
+    #[test]
+    fn auto_backend_uses_kernel_when_probe_succeeds() {
+        let backend = resolve_backend(RequestedBackend::Auto, false, || Ok(())).unwrap();
+        let expected = if cfg!(target_os = "linux") {
+            EffectiveBackend::Kernel
+        } else {
+            EffectiveBackend::Userspace
+        };
+        assert_eq!(backend, expected);
+    }
+
+    #[test]
+    fn auto_backend_falls_back_to_userspace_when_probe_fails() {
+        let backend = resolve_backend(RequestedBackend::Auto, false, || -> Result<()> {
+            Err(anyhow!("kernel unavailable"))
+        })
+        .unwrap();
+        assert_eq!(backend, EffectiveBackend::Userspace);
+    }
 
     #[test]
     fn accepts_connected_response() {

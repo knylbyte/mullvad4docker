@@ -12,6 +12,7 @@ ipnetwork = "0.21"
 libc = "0.2"
 log = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tempfile = "3.18"
 tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tun = "0.8.6"
 talpid-tunnel-config-client = { git = "https://github.com/mullvad/mullvadvpn-app.git", rev = "8f4f4d4de18c275c8fa1ddd1c6642819bd13d736", package = "talpid-tunnel-config-client" }

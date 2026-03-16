@@ -9,6 +9,7 @@ services:
       DAITA_ENABLED: "true"
       DANTE_ENABLED: "false"
       KILLSWITCH_ENABLED: "false"
+      WG_BACKEND: "auto"
       WG_INTERFACE: wg0
       WG_CONFIG_FILE: /etc/wireguard/wg0.conf
     volumes:
