@@ -1,31 +1,36 @@
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Local};
 use mullvad_daita_controller::config::{DEFAULT_MTU, InterfaceMtu, ParsedConfig};
 use mullvad_daita_controller::killswitch;
 use mullvad_daita_controller::mtu;
+use mullvad_daita_controller::uapi::UapiClient;
 use reqwest::Client;
 use std::env;
-use std::ffi::{CStr, CString, c_char};
 use std::fs;
+use std::io::Write;
+use std::io::{BufRead, BufReader, Read};
 use std::net::IpAddr;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-use std::path::PathBuf;
-use std::process::{self, Command};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::{self, Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use talpid_tunnel_config_client::request_ephemeral_peer;
 use talpid_types::net::wireguard::PrivateKey;
 use tempfile::NamedTempFile;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
-use tun::AbstractDevice;
-use wireguard_go_rs::{LoggingContext, Tunnel, WgLogLevel};
 
-const DAITA_EVENTS_CAPACITY: u32 = 2048;
-const DAITA_ACTIONS_CAPACITY: u32 = 1024;
 const MULLVAD_CONNECTION_TEST_URL: &str = "https://am.i.mullvad.net/connected";
 const MULLVAD_CONNECTION_SUCCESS_TEXT: &str = "You are connected to Mullvad";
 const MULLVAD_CONNECTION_TEST_ATTEMPTS: u32 = 6;
 const MULLVAD_CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MULLVAD_CONNECTION_TEST_RETRY_DELAY: Duration = Duration::from_secs(5);
+const GOTATUN_BIN: &str = "gotatun";
+const GOTATUN_SOCKET_DIR: &str = "/var/run/wireguard";
+const GOTATUN_START_TIMEOUT: Duration = Duration::from_secs(10);
+const GOTATUN_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const GOTATUN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const GOTATUN_RUST_LOG: &str = "gotatun=info,gotatun::device::uapi=warn";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequestedBackend {
@@ -98,8 +103,14 @@ struct SystemState {
     resolv_conf_backup: Option<String>,
 }
 
+#[derive(Debug)]
+struct UserspaceTunnel {
+    child: Child,
+    uapi_client: UapiClient,
+}
+
 enum ActiveTunnel {
-    Userspace(Tunnel),
+    Userspace(UserspaceTunnel),
     Kernel,
 }
 
@@ -170,9 +181,12 @@ impl Controller {
         self.effective_mtu = self.resolve_interface_mtu().await?;
         self.run_hooks("PreUp", &self.config.hooks.pre_up)?;
         self.start_tunnel()?;
-        self.configure_interface()?;
-        if self.runtime.daita_enabled {
-            self.activate_daita().await?;
+        if self.runtime.daita_enabled && self.backend == EffectiveBackend::Userspace {
+            self.configure_interface_without_dns()?;
+            self.activate_daita_userspace().await?;
+            self.configure_interface()?;
+        } else {
+            self.configure_interface()?;
         }
         if self.runtime.killswitch_enabled {
             self.install_killswitch()?;
@@ -206,42 +220,32 @@ impl Controller {
     }
 
     fn start_userspace_tunnel(&self) -> Result<ActiveTunnel> {
-        let mut tun_config = tun::Configuration::default();
-        tun_config.tun_name(&self.runtime.interface_name);
-        tun_config.mtu(self.effective_mtu);
-        #[cfg(target_os = "linux")]
-        tun_config.platform_config(|config| {
-            #[allow(deprecated)]
-            {
-                config.packet_information(true);
-            }
-        });
+        let request = self.config.initial_uapi_request()?;
+        self.start_userspace_tunnel_with_request(&request)
+    }
 
-        let device = tun::create(&tun_config).context("failed to create TUN device")?;
-        let actual_name = device
-            .tun_name()
-            .context("failed to query TUN device name")?;
-        if actual_name != self.runtime.interface_name {
-            bail!(
-                "requested interface {} but kernel created {}",
-                self.runtime.interface_name,
-                actual_name
-            );
-        }
+    fn start_userspace_tunnel_with_request(&self, request: &str) -> Result<ActiveTunnel> {
+        let socket_path = gotatun_socket_path(&self.runtime.interface_name);
+        let _ = fs::remove_file(&socket_path);
 
-        let fd = device.into_raw_fd();
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let settings = self.config.initial_settings()?;
-        let tunnel = Tunnel::turn_on(
-            self.effective_mtu as isize,
-            &settings,
-            owned_fd,
-            Some(wireguard_log_callback),
-            0 as LoggingContext,
-        )
-        .map_err(|error| anyhow!("failed to start wireguard-go tunnel: {error}"))?;
+        let mut child = spawn_gotatun(&self.runtime.interface_name)?;
 
-        Ok(ActiveTunnel::Userspace(tunnel))
+        let uapi_client = UapiClient::new(socket_path);
+        wait_for_userspace_tunnel_ready(
+            &mut child,
+            &uapi_client,
+            &self.runtime.interface_name,
+            GOTATUN_START_TIMEOUT,
+        )?;
+
+        uapi_client
+            .set(request)
+            .context("failed to configure gotatun through UAPI")?;
+
+        Ok(ActiveTunnel::Userspace(UserspaceTunnel {
+            child,
+            uapi_client,
+        }))
     }
 
     fn start_kernel_tunnel(&self) -> Result<ActiveTunnel> {
@@ -284,16 +288,20 @@ impl Controller {
     }
 
     fn configure_interface(&mut self) -> Result<()> {
-        self.configure_endpoint_bypass_route()?;
-        self.apply_interface_addresses()?;
-        self.apply_link_state()?;
-        self.apply_tunnel_routes()?;
+        self.configure_interface_without_dns()?;
         self.apply_dns()?;
         Ok(())
     }
 
-    async fn activate_daita(&mut self) -> Result<()> {
-        let tunnel = self.active_userspace_tunnel()?;
+    fn configure_interface_without_dns(&mut self) -> Result<()> {
+        self.configure_endpoint_bypass_route()?;
+        self.apply_interface_addresses()?;
+        self.apply_link_state()?;
+        self.apply_tunnel_routes()?;
+        Ok(())
+    }
+
+    async fn activate_daita_userspace(&mut self) -> Result<()> {
         let config_service = self.config.config_service_ipv4();
         let ephemeral_private_key = PrivateKey::new_from_random();
         let exit_response = request_ephemeral_peer(
@@ -306,11 +314,11 @@ impl Controller {
         .await
         .map_err(|error| anyhow!("failed to request exit ephemeral peer: {error}"))?;
 
-        let (settings, daita_peer_public_key, daita) = if self.config.is_multihop() {
-            let entry_only_settings = self.config.entry_hop_config_for_ephemeral_exchange()?;
-            tunnel.set_config(&entry_only_settings).map_err(|error| {
-                anyhow!("failed to reconfigure tunnel for entry ephemeral exchange: {error}")
-            })?;
+        let settings = if self.config.is_multihop() {
+            let entry_only_settings = self.config.entry_hop_uapi_request()?;
+            log::info!("restarting gotatun for multihop DAITA peer exchange");
+            self.restart_userspace_tunnel(&entry_only_settings)?;
+            self.configure_interface_without_dns()?;
 
             let entry_response = request_ephemeral_peer(
                 config_service,
@@ -325,59 +333,33 @@ impl Controller {
             let daita = entry_response
                 .daita
                 .ok_or_else(|| anyhow!("relay config service returned no DAITA settings"))?;
-            let settings = self.config.multihop_daita_settings(
+            self.config.multihop_daita_uapi_request(
                 &ephemeral_private_key,
                 entry_response.psk.as_ref(),
                 exit_response.psk.as_ref(),
-            )?;
-
-            (settings, self.config.entry_peer.public_key.clone(), daita)
+                &daita,
+            )?
         } else {
             let daita = exit_response
                 .daita
                 .ok_or_else(|| anyhow!("relay config service returned no DAITA settings"))?;
-            let settings = self
-                .config
-                .daita_settings(&ephemeral_private_key, exit_response.psk.as_ref())?;
-
-            (settings, self.config.entry_peer.public_key.clone(), daita)
+            self.config.daita_uapi_request(
+                &ephemeral_private_key,
+                exit_response.psk.as_ref(),
+                &daita,
+            )?
         };
 
-        tunnel
-            .set_config(&settings)
-            .map_err(|error| anyhow!("failed to reconfigure tunnel for DAITA: {error}"))?;
-
-        let machines = daita
-            .client_machines
-            .into_iter()
-            .map(|machine| machine.serialize())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let machines =
-            CString::new(machines).context("relay config returned invalid maybenot machines")?;
-
-        tunnel
-            .activate_daita(
-                daita_peer_public_key.as_bytes(),
-                &machines,
-                daita.max_decoy_frac,
-                daita.max_delay_frac,
-                DAITA_EVENTS_CAPACITY,
-                DAITA_ACTIONS_CAPACITY,
-            )
-            .map_err(|error| anyhow!("failed to activate DAITA: {error}"))?;
-
+        log::info!("restarting gotatun to apply final DAITA configuration");
+        self.restart_userspace_tunnel(&settings)
+            .context("failed to apply DAITA reconfiguration to gotatun")?;
         Ok(())
     }
 
-    fn active_userspace_tunnel(&self) -> Result<&Tunnel> {
-        match self.tunnel.as_ref() {
-            Some(ActiveTunnel::Userspace(tunnel)) => Ok(tunnel),
-            Some(ActiveTunnel::Kernel) => {
-                bail!("DAITA is only supported with the userspace backend")
-            }
-            None => bail!("tunnel is not active"),
-        }
+    fn restart_userspace_tunnel(&mut self, request: &str) -> Result<()> {
+        self.stop_tunnel()?;
+        self.tunnel = Some(self.start_userspace_tunnel_with_request(request)?);
+        Ok(())
     }
 
     fn shutdown(&mut self, startup_failed: bool) -> Result<()> {
@@ -419,9 +401,11 @@ impl Controller {
 
     fn stop_tunnel(&mut self) -> Result<()> {
         match self.tunnel.take() {
-            Some(ActiveTunnel::Userspace(tunnel)) => tunnel
-                .turn_off()
-                .map_err(|error| anyhow!("failed to stop wireguard-go tunnel: {error}"))?,
+            Some(ActiveTunnel::Userspace(mut tunnel)) => {
+                terminate_child(&mut tunnel.child, GOTATUN_STOP_TIMEOUT)
+                    .context("failed to stop gotatun process")?;
+                let _ = fs::remove_file(tunnel.uapi_client.socket_path());
+            }
             Some(ActiveTunnel::Kernel) => {
                 run_ip([
                     "link",
@@ -501,6 +485,10 @@ impl Controller {
     }
 
     fn configure_endpoint_bypass_route(&mut self) -> Result<()> {
+        if self.system_state.endpoint_route.is_some() {
+            return Ok(());
+        }
+
         let family_flag = match self.config.entry_peer.endpoint.ip() {
             IpAddr::V4(_) => "-4",
             IpAddr::V6(_) => "-6",
@@ -735,6 +723,199 @@ where
     }
 }
 
+fn gotatun_socket_path(interface_name: &str) -> PathBuf {
+    Path::new(GOTATUN_SOCKET_DIR).join(format!("{interface_name}.sock"))
+}
+
+fn spawn_gotatun(interface_name: &str) -> Result<Child> {
+    let mut child = Command::new(GOTATUN_BIN)
+        .args(["--foreground", "--disable-drop-privileges", interface_name])
+        .env("CLICOLOR", "0")
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", GOTATUN_RUST_LOG)
+        .env("RUST_LOG_STYLE", "never")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", GOTATUN_BIN))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        spawn_gotatun_log_pump(stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_gotatun_log_pump(stderr);
+    }
+
+    Ok(child)
+}
+
+fn spawn_gotatun_log_pump<R>(reader: R)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let Some(line) = format_gotatun_log_line(&line) else {
+                continue;
+            };
+            eprintln!("{line}");
+        }
+    });
+}
+
+fn format_gotatun_log_line(line: &str) -> Option<String> {
+    let line = strip_ansi_escapes(line);
+    let line = line.trim();
+    if line.is_empty()
+        || line.starts_with("at ")
+        || line.contains("New UAPI connection on unix socket")
+        || line.contains("Peer added")
+        || line.contains("SIGTERM received")
+        || line.contains("GotaTun is shutting down")
+    {
+        return None;
+    }
+
+    let Some((timestamp, rest)) = line.split_once(' ') else {
+        return Some(format!("[gotatun] {line}"));
+    };
+    let Some(normalized_timestamp) = normalize_gotatun_timestamp(timestamp) else {
+        return Some(format!("[gotatun] {line}"));
+    };
+    let rest = rest.trim_start();
+
+    let mut parts = rest.splitn(3, ' ');
+    let level = parts.next()?.trim();
+    let target = parts.next()?.trim().trim_end_matches(':');
+    let message = parts.next()?.trim();
+
+    if level.is_empty() || target.is_empty() || message.is_empty() {
+        return Some(format!("[gotatun] {line}"));
+    }
+
+    Some(format!(
+        "[{normalized_timestamp} {level:<5} {target}] {message}"
+    ))
+}
+
+fn normalize_gotatun_timestamp(timestamp: &str) -> Option<String> {
+    let parsed = DateTime::parse_from_rfc3339(timestamp).ok()?;
+    Some(format_log_timestamp(parsed.with_timezone(&Local)))
+}
+
+fn format_log_timestamp<Tz>(timestamp: DateTime<Tz>) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    timestamp.format("%Y-%m-%dT%H:%M:%S%:z").to_string()
+}
+
+fn init_logger() {
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    logger.format(|buf, record| {
+        writeln!(
+            buf,
+            "[{} {:<5} {}] {}",
+            format_log_timestamp(Local::now()),
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
+    logger.init();
+}
+
+fn strip_ansi_escapes(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && matches!(chars.peek(), Some('[')) {
+            let _ = chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn wait_for_userspace_tunnel_ready(
+    child: &mut Child,
+    uapi_client: &UapiClient,
+    interface_name: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll gotatun child process")?
+        {
+            bail!("gotatun exited before it became ready: {}", status);
+        }
+
+        if interface_exists(interface_name) && uapi_client.get().is_ok() {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for gotatun interface {} and UAPI socket {}",
+                interface_name,
+                uapi_client.socket_path().display()
+            );
+        }
+
+        thread::sleep(GOTATUN_POLL_INTERVAL);
+    }
+}
+
+fn interface_exists(interface_name: &str) -> bool {
+    Path::new("/sys/class/net").join(interface_name).exists()
+}
+
+fn terminate_child(child: &mut Child, timeout: Duration) -> Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    let pid = child.id() as libc::pid_t;
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("failed to send SIGTERM to gotatun");
+        }
+    }
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(GOTATUN_POLL_INTERVAL);
+    }
+
+    child
+        .kill()
+        .context("failed to SIGKILL gotatun after graceful shutdown timeout")?;
+    let _ = child.wait();
+    Ok(())
+}
+
 fn probe_kernel_backend() -> Result<()> {
     let temp_interface = format!("wgp{}", process::id());
     run_ip([
@@ -876,37 +1057,22 @@ async fn wait_for_signal() -> Result<()> {
     Ok(())
 }
 
-unsafe extern "system" fn wireguard_log_callback(
-    level: WgLogLevel,
-    msg: *const c_char,
-    _context: LoggingContext,
-) {
-    if msg.is_null() {
-        return;
-    }
-
-    let message = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
-    match level {
-        0 => log::error!("wireguard-go: {}", message.trim_end()),
-        1 => log::warn!("wireguard-go: {}", message.trim_end()),
-        2 => log::info!("wireguard-go: {}", message.trim_end()),
-        _ => log::debug!("wireguard-go: {}", message.trim_end()),
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    init_logger();
     Controller::new().await?.run().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectiveBackend, RequestedBackend, is_mullvad_connection_confirmed,
-        normalize_response_body, resolve_backend,
+        EffectiveBackend, GOTATUN_SOCKET_DIR, RequestedBackend, format_gotatun_log_line,
+        format_log_timestamp, gotatun_socket_path, interface_exists,
+        is_mullvad_connection_confirmed, normalize_gotatun_timestamp, normalize_response_body,
+        resolve_backend, strip_ansi_escapes,
     };
     use anyhow::{Result, anyhow};
+    use chrono::{DateTime, Local};
 
     #[test]
     fn parses_backend_modes() {
@@ -971,6 +1137,14 @@ mod tests {
     }
 
     #[test]
+    fn builds_gotatun_socket_path() {
+        assert_eq!(
+            gotatun_socket_path("wg100").to_string_lossy(),
+            format!("{}/wg100.sock", GOTATUN_SOCKET_DIR)
+        );
+    }
+
+    #[test]
     fn accepts_connected_response() {
         assert!(is_mullvad_connection_confirmed(
             "You are connected to Mullvad. Your IP address is 1.2.3.4\n"
@@ -989,6 +1163,80 @@ mod tests {
         assert_eq!(
             normalize_response_body("You are connected\n  to Mullvad.\t"),
             "You are connected to Mullvad."
+        );
+    }
+
+    #[test]
+    fn interface_exists_returns_false_for_unknown_interface() {
+        assert!(!interface_exists("mullvad4docker-does-not-exist"));
+    }
+
+    #[test]
+    fn strips_ansi_escape_sequences_from_gotatun_logs() {
+        assert_eq!(
+            strip_ansi_escapes("\u{1b}[32mINFO\u{1b}[0m gotatun::unix"),
+            "INFO gotatun::unix"
+        );
+    }
+
+    #[test]
+    fn normalizes_gotatun_timestamps() {
+        let expected = format_log_timestamp(
+            DateTime::parse_from_rfc3339("2026-03-16T18:06:41.586272Z")
+                .unwrap()
+                .with_timezone(&Local),
+        );
+        assert_eq!(
+            normalize_gotatun_timestamp("2026-03-16T18:06:41.586272Z"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            normalize_gotatun_timestamp("2026-03-16T18:06:41Z"),
+            Some(expected)
+        );
+        assert_eq!(normalize_gotatun_timestamp("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn formats_gotatun_log_lines_like_controller_logs() {
+        let started_at = format_log_timestamp(
+            DateTime::parse_from_rfc3339("2026-03-16T18:06:41.586272Z")
+                .unwrap()
+                .with_timezone(&Local),
+        );
+        assert_eq!(
+            format_gotatun_log_line(
+                "  2026-03-16T18:06:41.586272Z  INFO gotatun::unix: GotaTun started successfully  "
+            ),
+            Some(format!(
+                "[{started_at} INFO  gotatun::unix] GotaTun started successfully"
+            ))
+        );
+        let daita_at = format_log_timestamp(
+            DateTime::parse_from_rfc3339("2026-03-16T18:06:42.105748Z")
+                .unwrap()
+                .with_timezone(&Local),
+        );
+        assert_eq!(
+            format_gotatun_log_line(
+                "2026-03-16T18:06:42.105748Z  INFO gotatun::device::daita::hooks: Initializing DAITA"
+            ),
+            Some(format!(
+                "[{daita_at} INFO  gotatun::device::daita::hooks] Initializing DAITA"
+            ))
+        );
+    }
+
+    #[test]
+    fn filters_and_falls_back_for_gotatun_log_lines() {
+        assert_eq!(
+            format_gotatun_log_line("    at gotatun/src/main.rs:1"),
+            None
+        );
+        assert_eq!(format_gotatun_log_line(""), None);
+        assert_eq!(
+            format_gotatun_log_line("thread 'tokio-rt-worker' panicked"),
+            Some("[gotatun] thread 'tokio-rt-worker' panicked".to_string())
         );
     }
 }

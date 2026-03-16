@@ -1,14 +1,16 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use ipnetwork::IpNetwork;
-use std::ffi::CString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use talpid_tunnel_config_client::DaitaSettings;
 use talpid_types::net::wireguard::{PresharedKey, PrivateKey, PublicKey};
 
 pub const DEFAULT_MTU: u16 = 1380;
 const DEFAULT_CONFIG_SERVICE_IPV4: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 1);
+const DAITA_MAX_DELAYED_PACKETS: usize = 1024;
+const DAITA_MIN_DELAY_CAPACITY: usize = 50;
 
 #[derive(Clone, Debug, Default)]
 pub struct Hooks {
@@ -25,7 +27,6 @@ pub struct PeerSettings {
     pub allowed_ips: Vec<IpNetwork>,
     pub preshared_key: Option<PresharedKey>,
     pub persistent_keepalive: Option<u16>,
-    pub constant_packet_size: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -239,19 +240,27 @@ impl ParsedConfig {
             .collect()
     }
 
-    pub fn initial_settings(&self) -> Result<CString> {
-        build_userspace_config(&self.private_key, self.fwmark, self.peers().cloned())
+    pub fn initial_uapi_request(&self) -> Result<String> {
+        build_userspace_config(
+            &self.private_key,
+            self.fwmark,
+            self.peers().map(|peer| UserSpacePeerConfig {
+                peer: peer.clone(),
+                daita: None,
+            }),
+        )
     }
 
     pub fn kernel_settings(&self) -> String {
         build_kernel_config(&self.private_key, self.fwmark, self.peers().cloned())
     }
 
-    pub fn daita_settings(
+    pub fn daita_uapi_request(
         &self,
         private_key: &PrivateKey,
         preshared_key: Option<&PresharedKey>,
-    ) -> Result<CString> {
+        daita: &DaitaSettings,
+    ) -> Result<String> {
         build_userspace_config(
             private_key,
             self.fwmark,
@@ -259,26 +268,29 @@ impl ParsedConfig {
                 if peer.public_key == self.entry_peer.public_key {
                     let mut peer = peer.clone();
                     peer.preshared_key = preshared_key.cloned();
-                    peer.constant_packet_size = true;
-                    peer
+                    UserSpacePeerConfig {
+                        peer,
+                        daita: Some(daita),
+                    }
                 } else {
                     let mut peer = peer.clone();
                     peer.preshared_key = preshared_key
                         .filter(|_| self.exit_peer.is_none())
                         .cloned()
                         .or_else(|| peer.preshared_key.clone());
-                    peer
+                    UserSpacePeerConfig { peer, daita: None }
                 }
             }),
         )
     }
 
-    pub fn multihop_daita_settings(
+    pub fn multihop_daita_uapi_request(
         &self,
         private_key: &PrivateKey,
         entry_preshared_key: Option<&PresharedKey>,
         exit_preshared_key: Option<&PresharedKey>,
-    ) -> Result<CString> {
+        daita: &DaitaSettings,
+    ) -> Result<String> {
         build_userspace_config(
             private_key,
             self.fwmark,
@@ -286,35 +298,54 @@ impl ParsedConfig {
                 let mut peer = peer.clone();
                 if peer.public_key == self.entry_peer.public_key {
                     peer.preshared_key = entry_preshared_key.cloned();
-                    peer.constant_packet_size = true;
+                    UserSpacePeerConfig {
+                        peer,
+                        daita: Some(daita),
+                    }
                 } else if peer.public_key == self.exit_peer().public_key {
                     peer.preshared_key = exit_preshared_key.cloned();
+                    UserSpacePeerConfig { peer, daita: None }
+                } else {
+                    UserSpacePeerConfig { peer, daita: None }
                 }
-                peer
             }),
         )
     }
 
-    pub fn entry_hop_config_for_ephemeral_exchange(&self) -> Result<CString> {
+    pub fn entry_hop_uapi_request(&self) -> Result<String> {
         let mut entry_peer = self.entry_peer.clone();
         let gateway = IpNetwork::from(IpAddr::V4(self.config_service_ipv4()));
         if !entry_peer.allowed_ips.contains(&gateway) {
             entry_peer.allowed_ips.push(gateway);
         }
 
-        build_userspace_config(&self.private_key, self.fwmark, std::iter::once(entry_peer))
+        build_userspace_config(
+            &self.private_key,
+            self.fwmark,
+            std::iter::once(UserSpacePeerConfig {
+                peer: entry_peer,
+                daita: None,
+            }),
+        )
     }
 }
 
-fn build_userspace_config<I>(
+#[derive(Clone)]
+struct UserSpacePeerConfig<'a> {
+    peer: PeerSettings,
+    daita: Option<&'a DaitaSettings>,
+}
+
+fn build_userspace_config<'a, I>(
     private_key: &PrivateKey,
     fwmark: Option<u32>,
     peers: I,
-) -> Result<CString>
+) -> Result<String>
 where
-    I: IntoIterator<Item = PeerSettings>,
+    I: IntoIterator<Item = UserSpacePeerConfig<'a>>,
 {
     let mut lines = Vec::new();
+    lines.push("set=1".to_string());
     lines.push(conf_line(
         "private_key",
         &hex::encode(private_key.to_bytes()),
@@ -326,7 +357,8 @@ where
     lines.push(conf_line("replace_peers", "true"));
 
     let mut peer_count = 0usize;
-    for peer in peers {
+    for peer_config in peers {
+        let peer = peer_config.peer;
         let allowed_ips = peer.allowed_ips;
         if allowed_ips.is_empty() {
             bail!("peer {} has no allowed IPs", peer.public_key.to_base64());
@@ -354,8 +386,27 @@ where
         for allowed_ip in &allowed_ips {
             lines.push(conf_line("allowed_ip", &allowed_ip.to_string()));
         }
-        if peer.constant_packet_size {
-            lines.push(conf_line("constant_packet_size", "true"));
+        if let Some(daita) = peer_config.daita {
+            lines.push(conf_line("daita_enable", "1"));
+            for machine in &daita.client_machines {
+                lines.push(conf_line("daita_machine", &machine.serialize()));
+            }
+            lines.push(conf_line(
+                "daita_max_delayed_packets",
+                &DAITA_MAX_DELAYED_PACKETS.to_string(),
+            ));
+            lines.push(conf_line(
+                "daita_min_delay_capacity",
+                &DAITA_MIN_DELAY_CAPACITY.to_string(),
+            ));
+            lines.push(conf_line(
+                "daita_max_decoy_frac",
+                &daita.max_decoy_frac.to_string(),
+            ));
+            lines.push(conf_line(
+                "daita_max_delay_frac",
+                &daita.max_delay_frac.to_string(),
+            ));
         }
     }
 
@@ -365,7 +416,7 @@ where
 
     lines.push(String::new());
 
-    CString::new(lines.join("\n")).context("failed to build userspace WireGuard config")
+    Ok(lines.join("\n"))
 }
 
 fn build_kernel_config<I>(private_key: &PrivateKey, fwmark: Option<u32>, peers: I) -> String
@@ -432,7 +483,6 @@ impl PendingPeer {
             },
             preshared_key: self.preshared_key,
             persistent_keepalive: self.persistent_keepalive,
-            constant_packet_size: false,
         })
     }
 }
@@ -483,6 +533,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use talpid_tunnel_config_client::DaitaSettings;
+    use talpid_types::net::wireguard::PrivateKey;
     use talpid_types::net::wireguard::PublicKey;
 
     fn peer(endpoint: Ipv4Addr, allowed_ips: &[IpNetwork]) -> PeerSettings {
@@ -492,7 +544,6 @@ mod tests {
             allowed_ips: allowed_ips.to_vec(),
             preshared_key: None,
             persistent_keepalive: None,
-            constant_packet_size: false,
         }
     }
 
@@ -598,6 +649,75 @@ mod tests {
         assert!(rendered.contains("Endpoint = 198.51.100.1:51820"));
         assert!(rendered.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
         assert!(rendered.contains("PersistentKeepalive = 25"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn renders_initial_uapi_request_for_supported_fields() {
+        let path = write_temp_config(
+            "[Interface]\n\
+             PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+             Address = 10.0.0.2/32\n\
+             FwMark = 1234\n\
+             \n\
+             [Peer]\n\
+             PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n\
+             Endpoint = 198.51.100.1:51820\n\
+             AllowedIPs = 0.0.0.0/0, ::/0\n\
+             PersistentKeepalive = 25\n",
+        );
+
+        let config = ParsedConfig::from_file(&path).unwrap();
+        let rendered = config.initial_uapi_request().unwrap();
+
+        assert!(rendered.starts_with("set=1\n"));
+        assert!(rendered.contains("private_key="));
+        assert!(rendered.contains("fwmark=1234"));
+        assert!(rendered.contains("replace_peers=true"));
+        assert!(rendered.contains("public_key="));
+        assert!(rendered.contains("endpoint=198.51.100.1:51820"));
+        assert!(rendered.contains("replace_allowed_ips=true"));
+        assert!(rendered.contains("allowed_ip=0.0.0.0/0"));
+        assert!(rendered.contains("allowed_ip=::/0"));
+        assert!(rendered.contains("persistent_keepalive_interval=25"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn renders_daita_uapi_request() {
+        let path = write_temp_config(
+            "[Interface]\n\
+             PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+             Address = 10.0.0.2/32\n\
+             \n\
+             [Peer]\n\
+             PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n\
+             Endpoint = 198.51.100.1:51820\n\
+             AllowedIPs = 0.0.0.0/0\n",
+        );
+
+        let config = ParsedConfig::from_file(&path).unwrap();
+        let private_key =
+            PrivateKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+        let rendered = config
+            .daita_uapi_request(
+                &private_key,
+                None,
+                &DaitaSettings {
+                    client_machines: vec![],
+                    max_decoy_frac: 0.25,
+                    max_delay_frac: 0.5,
+                },
+            )
+            .unwrap();
+
+        assert!(rendered.contains("daita_enable=1"));
+        assert!(rendered.contains("daita_max_delayed_packets=1024"));
+        assert!(rendered.contains("daita_min_delay_capacity=50"));
+        assert!(rendered.contains("daita_max_decoy_frac=0.25"));
+        assert!(rendered.contains("daita_max_delay_frac=0.5"));
 
         let _ = fs::remove_file(path);
     }

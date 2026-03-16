@@ -1,10 +1,10 @@
 # wireguard-go-daita
 
-Debian-based container that starts a Mullvad WireGuard tunnel through either the kernel WireGuard backend or Mullvad's `wireguard-go-rs` userspace backend, with optional support for Mullvad DAITA.
+Debian-based container that starts a Mullvad WireGuard tunnel through either the kernel WireGuard backend or Mullvad's `gotatun` userspace backend, with optional support for Mullvad DAITA.
 
 ## What it does
 
-- starts a userspace WireGuard tunnel through Mullvad's `libwg` / `wireguard-go-rs`
+- starts a userspace WireGuard tunnel through Mullvad's `gotatun`
 - can switch between `kernel` and `userspace` backends through `WG_BACKEND`
 - supports Mullvad single-hop and multihop configs
 - requests an ephemeral peer from Mullvad's relay config service when `DAITA_ENABLED=true`
@@ -52,7 +52,7 @@ Backend behavior:
 - `auto` is the default and recommended mode
 - `auto` prefers `kernel` when DAITA is disabled and the host exposes a working kernel WireGuard interface
 - `auto` falls back to `userspace` when the kernel probe fails
-- `userspace` always uses Mullvad `libwg` / `wireguard-go-rs`
+- `userspace` always uses Mullvad `gotatun`
 - `kernel` uses `ip link add ... type wireguard` plus `wg setconf`
 - `DAITA_ENABLED=true` requires the `userspace` backend; `WG_BACKEND=kernel` with DAITA is rejected at startup
 
