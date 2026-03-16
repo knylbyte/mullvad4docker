@@ -44,6 +44,8 @@ Relevant environment variables:
 - `WG_INTERFACE`
 - `WG_CONFIG_FILE`
 
+`Interface.MTU` in the mounted WireGuard config may be a fixed numeric value or `auto`. With `MTU = auto`, the controller probes the relay path with 10 parallel workers before the tunnel starts, logs the detected outer path MTU, and derives the WireGuard interface MTU from it.
+
 The controller:
 
 - creates the TUN device itself

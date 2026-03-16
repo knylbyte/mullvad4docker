@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use talpid_types::net::wireguard::{PresharedKey, PrivateKey, PublicKey};
 
-const DEFAULT_MTU: u16 = 1380;
+pub const DEFAULT_MTU: u16 = 1380;
 const DEFAULT_CONFIG_SERVICE_IPV4: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 1);
 
 #[derive(Clone, Debug, Default)]
@@ -28,12 +28,18 @@ pub struct PeerSettings {
     pub constant_packet_size: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum InterfaceMtu {
+    Fixed(u16),
+    Auto,
+}
+
 #[derive(Clone, Debug)]
 pub struct ParsedConfig {
     pub private_key: PrivateKey,
     pub addresses: Vec<IpNetwork>,
     pub dns_servers: Vec<IpAddr>,
-    pub mtu: u16,
+    pub mtu: InterfaceMtu,
     pub fwmark: Option<u32>,
     pub hooks: Hooks,
     pub entry_peer: PeerSettings,
@@ -103,9 +109,14 @@ impl ParsedConfig {
                         })?);
                     }
                     "mtu" => {
-                        interface_mtu = Some(value.parse::<u16>().with_context(|| {
-                            format!("invalid Interface.MTU on line {}", line_number)
-                        })?);
+                        if value.eq_ignore_ascii_case("auto") {
+                            interface_mtu = Some(InterfaceMtu::Auto);
+                        } else {
+                            interface_mtu =
+                                Some(InterfaceMtu::Fixed(value.parse::<u16>().with_context(
+                                    || format!("invalid Interface.MTU on line {}", line_number),
+                                )?));
+                        }
                     }
                     "fwmark" => {
                         interface_fwmark = Some(value.parse::<u32>().with_context(|| {
@@ -183,7 +194,7 @@ impl ParsedConfig {
             private_key,
             addresses: interface_addresses,
             dns_servers: interface_dns,
-            mtu: interface_mtu.unwrap_or(DEFAULT_MTU),
+            mtu: interface_mtu.unwrap_or(InterfaceMtu::Fixed(DEFAULT_MTU)),
             fwmark: interface_fwmark,
             hooks,
             entry_peer,
@@ -423,9 +434,12 @@ fn peer_looks_like_exit(peer: &PeerSettings) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerSettings, classify_peers};
+    use super::{InterfaceMtu, ParsedConfig, PeerSettings, classify_peers};
     use ipnetwork::IpNetwork;
+    use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use talpid_types::net::wireguard::PublicKey;
 
     fn peer(endpoint: Ipv4Addr, allowed_ips: &[IpNetwork]) -> PeerSettings {
@@ -493,6 +507,36 @@ mod tests {
 
         let error = classify_peers(input).unwrap_err().to_string();
         assert!(error.contains("exactly one exit peer"));
+    }
+
+    #[test]
+    fn parses_interface_mtu_auto() {
+        let path = write_temp_config(
+            "[Interface]\n\
+             PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+             Address = 10.0.0.2/32\n\
+             MTU = auto\n\
+             \n\
+             [Peer]\n\
+             PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n\
+             Endpoint = 185.65.135.1:51820\n\
+             AllowedIPs = 0.0.0.0/0\n",
+        );
+
+        let config = ParsedConfig::from_file(&path).unwrap();
+        assert!(matches!(config.mtu, InterfaceMtu::Auto));
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn write_temp_config(contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mullvad4docker-config-{unique}.conf"));
+        fs::write(&path, contents).unwrap();
+        path
     }
 }
 

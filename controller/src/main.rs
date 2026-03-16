@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
-use mullvad_daita_controller::config::ParsedConfig;
+use mullvad_daita_controller::config::{DEFAULT_MTU, InterfaceMtu, ParsedConfig};
 use mullvad_daita_controller::killswitch;
+use mullvad_daita_controller::mtu;
 use reqwest::Client;
 use std::env;
 use std::ffi::{CStr, CString, c_char};
@@ -60,6 +61,7 @@ struct Controller {
     tunnel: Option<Tunnel>,
     system_state: SystemState,
     post_up_completed: bool,
+    effective_mtu: u16,
 }
 
 impl RuntimeConfig {
@@ -85,6 +87,7 @@ impl Controller {
             tunnel: None,
             system_state: SystemState::default(),
             post_up_completed: false,
+            effective_mtu: DEFAULT_MTU,
         })
     }
 
@@ -105,6 +108,7 @@ impl Controller {
             self.runtime.config_file.display()
         );
 
+        self.effective_mtu = self.resolve_interface_mtu().await?;
         self.run_hooks("PreUp", &self.config.hooks.pre_up)?;
         self.start_tunnel()?;
         self.configure_interface()?;
@@ -130,7 +134,7 @@ impl Controller {
     fn start_tunnel(&mut self) -> Result<()> {
         let mut tun_config = tun::Configuration::default();
         tun_config.tun_name(&self.runtime.interface_name);
-        tun_config.mtu(self.config.mtu);
+        tun_config.mtu(self.effective_mtu);
         #[cfg(target_os = "linux")]
         tun_config.platform_config(|config| {
             #[allow(deprecated)]
@@ -155,7 +159,7 @@ impl Controller {
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let settings = self.config.initial_settings()?;
         let tunnel = Tunnel::turn_on(
-            self.config.mtu as isize,
+            self.effective_mtu as isize,
             &settings,
             owned_fd,
             Some(wireguard_log_callback),
@@ -450,9 +454,37 @@ impl Controller {
             "dev",
             self.runtime.interface_name.as_str(),
             "mtu",
-            &self.config.mtu.to_string(),
+            &self.effective_mtu.to_string(),
             "up",
         ])
+    }
+
+    async fn resolve_interface_mtu(&self) -> Result<u16> {
+        match self.config.mtu {
+            InterfaceMtu::Fixed(mtu) => Ok(mtu),
+            InterfaceMtu::Auto => {
+                let endpoint = self.config.entry_peer.endpoint;
+                log::info!(
+                    "probing auto MTU for {} with {} workers",
+                    endpoint,
+                    mtu::AUTO_MTU_WORKERS
+                );
+                let result =
+                    tokio::task::spawn_blocking(move || mtu::detect_wireguard_mtu(endpoint))
+                        .await
+                        .map_err(|error| anyhow!("auto MTU probe task failed: {error}"))??;
+
+                log::info!(
+                    "auto MTU detected for {}: outer path MTU {}, WireGuard overhead {}, using interface MTU {}",
+                    endpoint,
+                    result.outer_path_mtu,
+                    result.wireguard_overhead,
+                    result.wireguard_mtu
+                );
+
+                Ok(result.wireguard_mtu)
+            }
+        }
     }
 
     fn apply_tunnel_routes(&self) -> Result<()> {
