@@ -31,6 +31,9 @@ const GOTATUN_START_TIMEOUT: Duration = Duration::from_secs(10);
 const GOTATUN_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GOTATUN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GOTATUN_RUST_LOG: &str = "gotatun=info,gotatun::device::uapi=warn";
+const POLICY_RULE_PRIORITY: u32 = 10000;
+const SUPPRESS_RULE_PRIORITY: u32 = 10001;
+const SRC_VALID_MARK_PATH: &str = "/proc/sys/net/ipv4/conf/all/src_valid_mark";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequestedBackend {
@@ -96,9 +99,31 @@ struct RouteRecord {
     via: Option<IpAddr>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl RouteFamily {
+    fn family_flag(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "-4",
+            Self::Ipv6 => "-6",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PolicyRoutingState {
+    fwmark: u32,
+    families: Vec<RouteFamily>,
+}
+
 #[derive(Debug, Default)]
 struct SystemState {
     endpoint_route: Option<RouteRecord>,
+    policy_routing: Option<PolicyRoutingState>,
     killswitch_installed: bool,
     resolv_conf_backup: Option<String>,
 }
@@ -297,7 +322,11 @@ impl Controller {
         self.configure_endpoint_bypass_route()?;
         self.apply_interface_addresses()?;
         self.apply_link_state()?;
-        self.apply_tunnel_routes()?;
+        if self.uses_policy_routing() {
+            self.install_policy_routing()?;
+        } else {
+            self.apply_direct_routes()?;
+        }
         Ok(())
     }
 
@@ -357,6 +386,8 @@ impl Controller {
     }
 
     fn restart_userspace_tunnel(&mut self, request: &str) -> Result<()> {
+        self.remove_policy_routing()?;
+        self.remove_endpoint_bypass_route()?;
         self.stop_tunnel()?;
         self.tunnel = Some(self.start_userspace_tunnel_with_request(request)?);
         Ok(())
@@ -367,10 +398,11 @@ impl Controller {
             self.run_hooks("PreDown", &self.config.hooks.pre_down)?;
         }
 
-        self.remove_killswitch()?;
         self.restore_dns()?;
+        self.remove_policy_routing()?;
         self.remove_endpoint_bypass_route()?;
         self.stop_tunnel()?;
+        self.remove_killswitch()?;
 
         if !startup_failed && self.post_up_completed {
             self.run_hooks("PostDown", &self.config.hooks.post_down)?;
@@ -383,7 +415,7 @@ impl Controller {
         log::info!("installing container kill switch");
         killswitch::install(
             &self.runtime.interface_name,
-            self.config.entry_peer.endpoint.ip(),
+            self.config.entry_peer.endpoint,
         )?;
         self.system_state.killswitch_installed = true;
         Ok(())
@@ -599,7 +631,7 @@ impl Controller {
         }
     }
 
-    fn apply_tunnel_routes(&self) -> Result<()> {
+    fn apply_direct_routes(&self) -> Result<()> {
         for allowed_ip in self.config.effective_allowed_ips() {
             let family_flag = if allowed_ip.is_ipv4() { "-4" } else { "-6" };
             if allowed_ip.prefix() == 0 {
@@ -623,6 +655,85 @@ impl Controller {
                 ])?;
             }
         }
+        Ok(())
+    }
+
+    fn uses_policy_routing(&self) -> bool {
+        !self.full_tunnel_families().is_empty()
+    }
+
+    fn full_tunnel_families(&self) -> Vec<RouteFamily> {
+        let allowed_ips = self.config.effective_allowed_ips();
+        let mut families = Vec::new();
+
+        if allowed_ips
+            .iter()
+            .any(|network| network.is_ipv4() && network.prefix() == 0)
+        {
+            families.push(RouteFamily::Ipv4);
+        }
+        if allowed_ips
+            .iter()
+            .any(|network| network.is_ipv6() && network.prefix() == 0)
+        {
+            families.push(RouteFamily::Ipv6);
+        }
+
+        families
+    }
+
+    fn install_policy_routing(&mut self) -> Result<()> {
+        if self.system_state.policy_routing.is_some() {
+            return Ok(());
+        }
+
+        let fwmark = self.config.effective_fwmark();
+        let families = self.full_tunnel_families();
+        if families.is_empty() {
+            return Ok(());
+        }
+
+        log::info!(
+            "installing policy routing with fwmark {} for {:?}",
+            fwmark,
+            families
+        );
+
+        if families.contains(&RouteFamily::Ipv4) {
+            ensure_src_valid_mark_enabled()?;
+        }
+
+        for family in &families {
+            let _ = run_ip(build_policy_suppress_rule_del_args(*family));
+            let _ = run_ip(build_policy_mark_rule_del_args(*family, fwmark));
+            run_ip(build_policy_default_route_args(
+                *family,
+                self.runtime.interface_name.as_str(),
+                fwmark,
+            ))?;
+            run_ip(build_policy_mark_rule_add_args(*family, fwmark))?;
+            run_ip(build_policy_suppress_rule_add_args(*family))?;
+        }
+
+        self.system_state.policy_routing = Some(PolicyRoutingState { fwmark, families });
+        Ok(())
+    }
+
+    fn remove_policy_routing(&mut self) -> Result<()> {
+        let Some(state) = self.system_state.policy_routing.take() else {
+            return Ok(());
+        };
+
+        for family in state.families.iter().copied() {
+            let _ = run_ip(build_policy_suppress_rule_del_args(family));
+            let _ = run_ip(build_policy_mark_rule_del_args(family, state.fwmark));
+            let _ = run_ip(build_policy_default_route_del_args(
+                family,
+                self.runtime.interface_name.as_str(),
+                state.fwmark,
+            ));
+        }
+
         Ok(())
     }
 
@@ -980,6 +1091,114 @@ fn read_default_route(family_flag: &str) -> Result<DefaultRoute> {
     })
 }
 
+fn build_policy_default_route_args(
+    family: RouteFamily,
+    interface_name: &str,
+    table: u32,
+) -> Vec<String> {
+    vec![
+        family.family_flag().into(),
+        "route".into(),
+        "replace".into(),
+        "default".into(),
+        "dev".into(),
+        interface_name.into(),
+        "table".into(),
+        table.to_string(),
+    ]
+}
+
+fn build_policy_default_route_del_args(
+    family: RouteFamily,
+    interface_name: &str,
+    table: u32,
+) -> Vec<String> {
+    vec![
+        family.family_flag().into(),
+        "route".into(),
+        "del".into(),
+        "default".into(),
+        "dev".into(),
+        interface_name.into(),
+        "table".into(),
+        table.to_string(),
+    ]
+}
+
+fn build_policy_mark_rule_add_args(family: RouteFamily, fwmark: u32) -> Vec<String> {
+    vec![
+        family.family_flag().into(),
+        "rule".into(),
+        "add".into(),
+        "not".into(),
+        "fwmark".into(),
+        fwmark.to_string(),
+        "table".into(),
+        fwmark.to_string(),
+        "priority".into(),
+        POLICY_RULE_PRIORITY.to_string(),
+    ]
+}
+
+fn build_policy_mark_rule_del_args(family: RouteFamily, fwmark: u32) -> Vec<String> {
+    vec![
+        family.family_flag().into(),
+        "rule".into(),
+        "del".into(),
+        "not".into(),
+        "fwmark".into(),
+        fwmark.to_string(),
+        "table".into(),
+        fwmark.to_string(),
+        "priority".into(),
+        POLICY_RULE_PRIORITY.to_string(),
+    ]
+}
+
+fn build_policy_suppress_rule_add_args(family: RouteFamily) -> Vec<String> {
+    vec![
+        family.family_flag().into(),
+        "rule".into(),
+        "add".into(),
+        "table".into(),
+        "main".into(),
+        "suppress_prefixlength".into(),
+        "0".into(),
+        "priority".into(),
+        SUPPRESS_RULE_PRIORITY.to_string(),
+    ]
+}
+
+fn build_policy_suppress_rule_del_args(family: RouteFamily) -> Vec<String> {
+    vec![
+        family.family_flag().into(),
+        "rule".into(),
+        "del".into(),
+        "table".into(),
+        "main".into(),
+        "suppress_prefixlength".into(),
+        "0".into(),
+        "priority".into(),
+        SUPPRESS_RULE_PRIORITY.to_string(),
+    ]
+}
+
+fn ensure_src_valid_mark_enabled() -> Result<()> {
+    let current = fs::read_to_string(SRC_VALID_MARK_PATH)
+        .context("failed to read net.ipv4.conf.all.src_valid_mark")?;
+    validate_src_valid_mark_value(&current)
+}
+
+fn validate_src_valid_mark_value(current: &str) -> Result<()> {
+    if current.trim() == "1" {
+        return Ok(());
+    }
+
+    bail!(
+        "full-tunnel policy routing requires net.ipv4.conf.all.src_valid_mark=1; set it via container sysctls"
+    );
+}
+
 fn run_ip<I, S>(args: I) -> Result<()>
 where
     I: IntoIterator<Item = S>,
@@ -1066,10 +1285,14 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectiveBackend, GOTATUN_SOCKET_DIR, RequestedBackend, format_gotatun_log_line,
-        format_log_timestamp, gotatun_socket_path, interface_exists,
-        is_mullvad_connection_confirmed, normalize_gotatun_timestamp, normalize_response_body,
-        resolve_backend, strip_ansi_escapes,
+        EffectiveBackend, GOTATUN_SOCKET_DIR, POLICY_RULE_PRIORITY, RequestedBackend, RouteFamily,
+        SUPPRESS_RULE_PRIORITY, build_policy_default_route_args,
+        build_policy_default_route_del_args, build_policy_mark_rule_add_args,
+        build_policy_mark_rule_del_args, build_policy_suppress_rule_add_args,
+        build_policy_suppress_rule_del_args, format_gotatun_log_line, format_log_timestamp,
+        gotatun_socket_path, interface_exists, is_mullvad_connection_confirmed,
+        normalize_gotatun_timestamp, normalize_response_body, resolve_backend, strip_ansi_escapes,
+        validate_src_valid_mark_value,
     };
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Local};
@@ -1238,5 +1461,89 @@ mod tests {
             format_gotatun_log_line("thread 'tokio-rt-worker' panicked"),
             Some("[gotatun] thread 'tokio-rt-worker' panicked".to_string())
         );
+    }
+
+    #[test]
+    fn builds_policy_routing_commands() {
+        assert_eq!(
+            build_policy_default_route_args(RouteFamily::Ipv4, "wg0", 51820),
+            vec![
+                "-4", "route", "replace", "default", "dev", "wg0", "table", "51820"
+            ]
+        );
+        assert_eq!(
+            build_policy_default_route_del_args(RouteFamily::Ipv6, "wg0", 51820),
+            vec![
+                "-6", "route", "del", "default", "dev", "wg0", "table", "51820"
+            ]
+        );
+        assert_eq!(
+            build_policy_mark_rule_add_args(RouteFamily::Ipv4, 51820),
+            vec![
+                "-4",
+                "rule",
+                "add",
+                "not",
+                "fwmark",
+                "51820",
+                "table",
+                "51820",
+                "priority",
+                &POLICY_RULE_PRIORITY.to_string()
+            ]
+        );
+        assert_eq!(
+            build_policy_mark_rule_del_args(RouteFamily::Ipv6, 51820),
+            vec![
+                "-6",
+                "rule",
+                "del",
+                "not",
+                "fwmark",
+                "51820",
+                "table",
+                "51820",
+                "priority",
+                &POLICY_RULE_PRIORITY.to_string()
+            ]
+        );
+        assert_eq!(
+            build_policy_suppress_rule_add_args(RouteFamily::Ipv4),
+            vec![
+                "-4",
+                "rule",
+                "add",
+                "table",
+                "main",
+                "suppress_prefixlength",
+                "0",
+                "priority",
+                &SUPPRESS_RULE_PRIORITY.to_string()
+            ]
+        );
+        assert_eq!(
+            build_policy_suppress_rule_del_args(RouteFamily::Ipv6),
+            vec![
+                "-6",
+                "rule",
+                "del",
+                "table",
+                "main",
+                "suppress_prefixlength",
+                "0",
+                "priority",
+                &SUPPRESS_RULE_PRIORITY.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn validates_src_valid_mark_requirement() {
+        assert!(validate_src_valid_mark_value("1\n").is_ok());
+        let error = validate_src_valid_mark_value("0\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("src_valid_mark=1"));
+        assert!(error.contains("container sysctls"));
     }
 }

@@ -8,6 +8,7 @@ use talpid_tunnel_config_client::DaitaSettings;
 use talpid_types::net::wireguard::{PresharedKey, PrivateKey, PublicKey};
 
 pub const DEFAULT_MTU: u16 = 1380;
+pub const DEFAULT_FWMARK: u32 = 51820;
 const DEFAULT_CONFIG_SERVICE_IPV4: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 1);
 const DAITA_MAX_DELAYED_PACKETS: usize = 1024;
 const DAITA_MIN_DELAY_CAPACITY: usize = 50;
@@ -240,10 +241,14 @@ impl ParsedConfig {
             .collect()
     }
 
+    pub fn effective_fwmark(&self) -> u32 {
+        self.fwmark.unwrap_or(DEFAULT_FWMARK)
+    }
+
     pub fn initial_uapi_request(&self) -> Result<String> {
         build_userspace_config(
             &self.private_key,
-            self.fwmark,
+            Some(self.effective_fwmark()),
             self.peers().map(|peer| UserSpacePeerConfig {
                 peer: peer.clone(),
                 daita: None,
@@ -252,7 +257,11 @@ impl ParsedConfig {
     }
 
     pub fn kernel_settings(&self) -> String {
-        build_kernel_config(&self.private_key, self.fwmark, self.peers().cloned())
+        build_kernel_config(
+            &self.private_key,
+            Some(self.effective_fwmark()),
+            self.peers().cloned(),
+        )
     }
 
     pub fn daita_uapi_request(
@@ -263,7 +272,7 @@ impl ParsedConfig {
     ) -> Result<String> {
         build_userspace_config(
             private_key,
-            self.fwmark,
+            Some(self.effective_fwmark()),
             self.peers().map(|peer| {
                 if peer.public_key == self.entry_peer.public_key {
                     let mut peer = peer.clone();
@@ -293,7 +302,7 @@ impl ParsedConfig {
     ) -> Result<String> {
         build_userspace_config(
             private_key,
-            self.fwmark,
+            Some(self.effective_fwmark()),
             self.peers().map(|peer| {
                 let mut peer = peer.clone();
                 if peer.public_key == self.entry_peer.public_key {
@@ -321,7 +330,7 @@ impl ParsedConfig {
 
         build_userspace_config(
             &self.private_key,
-            self.fwmark,
+            Some(self.effective_fwmark()),
             std::iter::once(UserSpacePeerConfig {
                 peer: entry_peer,
                 daita: None,
@@ -527,7 +536,7 @@ fn peer_looks_like_exit(peer: &PeerSettings) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterfaceMtu, ParsedConfig, PeerSettings, classify_peers};
+    use super::{DEFAULT_FWMARK, InterfaceMtu, ParsedConfig, PeerSettings, classify_peers};
     use ipnetwork::IpNetwork;
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -681,6 +690,33 @@ mod tests {
         assert!(rendered.contains("allowed_ip=0.0.0.0/0"));
         assert!(rendered.contains("allowed_ip=::/0"));
         assert!(rendered.contains("persistent_keepalive_interval=25"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn applies_default_fwmark_when_config_omits_it() {
+        let path = write_temp_config(
+            "[Interface]\n\
+             PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+             Address = 10.0.0.2/32\n\
+             \n\
+             [Peer]\n\
+             PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n\
+             Endpoint = 198.51.100.1:51820\n\
+             AllowedIPs = 0.0.0.0/0\n",
+        );
+
+        let config = ParsedConfig::from_file(&path).unwrap();
+
+        assert_eq!(config.effective_fwmark(), DEFAULT_FWMARK);
+        assert!(
+            config
+                .initial_uapi_request()
+                .unwrap()
+                .contains("fwmark=51820")
+        );
+        assert!(config.kernel_settings().contains("FwMark = 51820"));
 
         let _ = fs::remove_file(path);
     }

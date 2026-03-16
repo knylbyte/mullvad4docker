@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
 
     if let Err(error) = async {
         if runtime.killswitch_enabled {
-            killswitch::install(&runtime.interface_name, config.entry_peer.endpoint.ip())?;
+            killswitch::install(&runtime.interface_name, config.entry_peer.endpoint)?;
         }
         wait_for_signal().await
     }

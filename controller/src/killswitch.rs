@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::Command;
 
 #[derive(Clone, Copy, Debug)]
@@ -31,16 +31,16 @@ impl FirewallFamily {
     }
 }
 
-pub fn install(interface_name: &str, entry_endpoint_ip: IpAddr) -> Result<()> {
-    let ipv4_entry_endpoint = match entry_endpoint_ip {
-        IpAddr::V4(ip) => Some(IpAddr::V4(ip)),
+pub fn install(interface_name: &str, entry_endpoint: SocketAddr) -> Result<()> {
+    let ipv4_entry_endpoint = match entry_endpoint.ip() {
+        IpAddr::V4(ip) => Some(SocketAddr::new(IpAddr::V4(ip), entry_endpoint.port())),
         IpAddr::V6(_) => None,
     };
     install_for_family(FirewallFamily::Ipv4, interface_name, ipv4_entry_endpoint)?;
 
-    let ipv6_entry_endpoint = match entry_endpoint_ip {
+    let ipv6_entry_endpoint = match entry_endpoint.ip() {
         IpAddr::V4(_) => None,
-        IpAddr::V6(ip) => Some(IpAddr::V6(ip)),
+        IpAddr::V6(ip) => Some(SocketAddr::new(IpAddr::V6(ip), entry_endpoint.port())),
     };
     install_for_family(FirewallFamily::Ipv6, interface_name, ipv6_entry_endpoint)?;
 
@@ -58,7 +58,7 @@ pub fn remove_all() {
 fn install_for_family(
     family: FirewallFamily,
     interface_name: &str,
-    entry_endpoint_ip: Option<IpAddr>,
+    entry_endpoint: Option<SocketAddr>,
 ) -> Result<()> {
     run_firewall(
         family,
@@ -72,7 +72,7 @@ fn install_for_family(
         }
     })?;
 
-    for command in build_killswitch_install_commands(family, interface_name, entry_endpoint_ip) {
+    for command in build_killswitch_install_commands(family, interface_name, entry_endpoint) {
         run_firewall(family, command.iter().map(String::as_str))?;
     }
 
@@ -127,7 +127,7 @@ pub fn build_insert_output_jump_args(family: FirewallFamily) -> Vec<String> {
 pub fn build_killswitch_install_commands(
     family: FirewallFamily,
     interface_name: &str,
-    entry_endpoint_ip: Option<IpAddr>,
+    entry_endpoint: Option<SocketAddr>,
 ) -> Vec<Vec<String>> {
     let chain = family.chain_name();
     let mut commands = vec![
@@ -170,12 +170,16 @@ pub fn build_killswitch_install_commands(
         ],
     ];
 
-    if let Some(entry_endpoint_ip) = entry_endpoint_ip {
+    if let Some(entry_endpoint) = entry_endpoint {
         commands.push(vec![
             "-A".into(),
             chain.into(),
+            "-p".into(),
+            "udp".into(),
             "-d".into(),
-            family.destination_cidr(&entry_endpoint_ip.to_string()),
+            family.destination_cidr(&entry_endpoint.ip().to_string()),
+            "--dport".into(),
+            entry_endpoint.port().to_string(),
             "-j".into(),
             "RETURN".into(),
         ]);
@@ -225,14 +229,17 @@ mod tests {
         build_insert_output_jump_args, build_killswitch_install_commands,
         build_killswitch_remove_commands,
     };
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
     fn builds_ipv4_killswitch_install_commands() {
         let commands = build_killswitch_install_commands(
             FirewallFamily::Ipv4,
             "wg0",
-            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                51820,
+            )),
         );
 
         assert_eq!(commands[0], vec!["-F", "MULLVAD_KILLSWITCH_V4"]);
@@ -249,8 +256,12 @@ mod tests {
             vec![
                 "-A",
                 "MULLVAD_KILLSWITCH_V4",
+                "-p",
+                "udp",
                 "-d",
                 "1.2.3.4/32",
+                "--dport",
+                "51820",
                 "-j",
                 "RETURN"
             ]
@@ -273,8 +284,13 @@ mod tests {
         assert!(
             !commands
                 .iter()
-                .any(|command| { command.windows(2).any(|window| window == ["-d", "::1/128"]) })
+                .any(|command| command.windows(2).any(|window| window == ["-d", "::1/128"]))
         );
+        assert!(!commands.iter().any(|command| {
+            command
+                .windows(2)
+                .any(|window| window == ["--dport", "51820"])
+        }));
     }
 
     #[test]
@@ -282,7 +298,7 @@ mod tests {
         let commands = build_killswitch_install_commands(
             FirewallFamily::Ipv6,
             "wg0",
-            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51820)),
         );
 
         assert!(commands.iter().any(|command| {
@@ -290,8 +306,12 @@ mod tests {
                 == &vec![
                     "-A".to_string(),
                     "MULLVAD_KILLSWITCH_V6".to_string(),
+                    "-p".to_string(),
+                    "udp".to_string(),
                     "-d".to_string(),
                     "::1/128".to_string(),
+                    "--dport".to_string(),
+                    "51820".to_string(),
                     "-j".to_string(),
                     "RETURN".to_string(),
                 ]

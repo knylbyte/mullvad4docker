@@ -47,6 +47,13 @@ Relevant environment variables:
 - `WG_INTERFACE`
 - `WG_CONFIG_FILE`
 
+For full-tunnel configs that install policy routing, the container must be started with:
+
+```yaml
+sysctls:
+  net.ipv4.conf.all.src_valid_mark: "1"
+```
+
 Backend behavior:
 
 - `auto` is the default and recommended mode
@@ -64,6 +71,8 @@ The controller:
 - creates the TUN device itself in `userspace` mode
 - creates the interface through the kernel in `kernel` mode
 - configures addresses and routes directly with `ip`
+- installs `fwmark`-based policy routing for full-tunnel configs and defaults `FwMark` to `51820` when omitted
+- requires `net.ipv4.conf.all.src_valid_mark=1` to already be set through container `sysctls` when IPv4 full-tunnel policy routing is active
 - rewrites `/etc/resolv.conf` from `DNS` entries while the tunnel is up
 - executes `PreUp`, `PostUp`, `PreDown`, `PostDown` hooks with `%i` replaced by `WG_INTERFACE`
 - verifies `https://am.i.mullvad.net/connected` before declaring startup successful and aborts if the response does not contain `You are connected to Mullvad`
@@ -74,8 +83,10 @@ When `KILLSWITCH_ENABLED=true`, the controller installs OUTPUT rules inside the 
 - allow loopback traffic
 - allow `RELATED,ESTABLISHED`
 - allow traffic exiting through `WG_INTERFACE`
-- allow traffic to the entry relay endpoint outside the tunnel
+- allow only UDP handshake traffic to the configured entry relay endpoint outside the tunnel
 - reject all other outbound traffic
+
+This kill switch is intended to protect the full shared namespace, so it is suitable for `network_mode: service:mullvad4docker` as long as the attached containers are expected to egress only through the Mullvad tunnel.
 
 Kernel mode requirements:
 
